@@ -1,0 +1,19 @@
+[
+    "ck_oo_numberOfPrivateMethods",
+    "ck_oo_numberOfPublicAttributes",
+    "ck_oo_noc",
+    "ck_oo_wmc",
+    "ck_oo_fanOut",
+    "ck_oo_numberOfLinesOfCode",
+    "ck_oo_numberOfAttributesInherited",
+    "ck_oo_numberOfMethods",
+    "ck_oo_dit",
+    "ck_oo_fanIn",
+    "ck_oo_lcom",
+    "ck_oo_rfc",
+    "ck_oo_cbo",
+    "ck_oo_numberOfAttributes",
+    "ck_oo_numberOfPrivateAttributes",
+    "ck_oo_numberOfMethodsInherited",
+    "ck_oo_numberOfPublicMethods"
+]
