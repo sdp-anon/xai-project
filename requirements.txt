@@ -2,6 +2,5 @@ streamlit
 joblib
 numpy
 pandas
-lime
 scikit-learn
-model.zip  
+lime
