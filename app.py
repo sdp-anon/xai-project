@@ -8,7 +8,6 @@ import os
 import zipfile
 from datetime import datetime
 import uuid
-
 from lime.lime_tabular import LimeTabularExplainer
 
 # =========================
@@ -30,17 +29,36 @@ st.caption(f"Participant ID: {st.session_state.user_id}")
 # =========================
 @st.cache_resource
 def load_resources():
-    # 🔓 Unzip model if not already extracted
-    if not os.path.exists("nasa_model.pkl"):
-        with zipfile.ZipFile("nasa_model.zip", 'r') as zip_ref:
-            zip_ref.extractall()
 
-    model = joblib.load("nasa_model.pkl")
+    # -------------------------
+    # FIX: correct zip handling
+    # -------------------------
+    zip_path = "nasa_model.zip"
+    extract_path = "model_files"
 
-    with open("nasa_feature_names.json") as f:
+    if not os.path.exists(extract_path):
+        os.makedirs(extract_path, exist_ok=True)
+
+    # unzip only once
+    if os.path.exists(zip_path) and not os.path.exists(f"{extract_path}/nasa_model.pkl"):
+        with zipfile.ZipFile(zip_path, "r") as zip_ref:
+            zip_ref.extractall(extract_path)
+
+    model_path = f"{extract_path}/nasa_model.pkl"
+    feature_path = f"{extract_path}/nasa_feature_names.json"
+    train_path = f"{extract_path}/nasa_X_train.csv"
+
+    # safety checks
+    if not os.path.exists(model_path):
+        st.error("❌ Model file not found after unzip!")
+        st.stop()
+
+    model = joblib.load(model_path)
+
+    with open(feature_path) as f:
         feature_names = json.load(f)
 
-    X_train = pd.read_csv("nasa_X_train.csv")
+    X_train = pd.read_csv(train_path)
     X_train_np = X_train[feature_names].values
 
     lime_explainer = LimeTabularExplainer(
@@ -51,6 +69,7 @@ def load_resources():
     )
 
     return model, feature_names, lime_explainer
+
 
 model, feature_names, lime_explainer = load_resources()
 
@@ -108,12 +127,7 @@ def generate_human_explanation(smart_rules):
         "dit": "Deep inheritance → harder to understand.",
         "lcom": "Low cohesion → poor design."
     }
-    exps = []
-    for r in smart_rules:
-        feat = extract_feature_name(r)
-        if feat in mapping:
-            exps.append(mapping[feat])
-    return list(set(exps))
+    return list({mapping[extract_feature_name(r)] for r in smart_rules if extract_feature_name(r) in mapping})
 
 def predict_and_explain(code):
     metrics = extract_metrics(code)
@@ -125,21 +139,15 @@ def predict_and_explain(code):
         X[0], model.predict_proba, num_features=10
     ).as_list()
 
-    full_lime_clean = [
-        r for r, w in lime_raw
-        if not (("<" in r and ">" in r) or (r.count('<') + r.count('>') > 1))
-    ]
-
     smart_lime = smart_select_lime(lime_raw, metrics)
-
-    anchor_rules = ["Anchor not available in cloud version"]
+    human = generate_human_explanation(smart_lime)
 
     return {
         "prob": prob,
         "severity": "High" if prob > 0.7 else "Medium" if prob > 0.3 else "Low",
-        "lime": full_lime_clean,
-        "combined": list(set(anchor_rules + smart_lime)),
-        "human": generate_human_explanation(smart_lime)
+        "lime": lime_raw,
+        "combined": smart_lime,
+        "human": human
     }
 
 # =========================
@@ -148,9 +156,8 @@ def predict_and_explain(code):
 file = st.file_uploader("Upload Java File", type=["java"])
 
 if file:
-    with st.spinner("Analyzing..."):
-        code = file.read().decode("utf-8")
-        res = predict_and_explain(code)
+    code = file.read().decode("utf-8")
+    res = predict_and_explain(code)
 
     st.metric("Defect Probability", f"{res['prob']*100:.1f}%", delta=res["severity"])
 
@@ -159,20 +166,16 @@ if file:
     with col1:
         st.subheader("LIME")
         for item in res["lime"]:
-            st.write(f"• {item}")
+            st.write(item)
 
     with col2:
         st.subheader("Rules")
         for rule in res["combined"]:
-            st.success(f"✔ {rule}")
-
-    st.divider()
+            st.success(rule)
 
     st.subheader("Expert Explanation")
     for exp in res["human"]:
         st.info(exp)
-
-    st.divider()
 
     # =========================
     # SURVEY
@@ -206,9 +209,6 @@ if file:
             df = pd.DataFrame([data])
             file_path = "survey_results.csv"
 
-            if not os.path.exists(file_path):
-                df.to_csv(file_path, index=False)
-            else:
-                df.to_csv(file_path, mode="a", header=False, index=False)
+            df.to_csv(file_path, mode="a", header=not os.path.exists(file_path), index=False)
 
             st.success("Saved ✅")
