@@ -9,7 +9,6 @@ from datetime import datetime
 import uuid
 
 from lime.lime_tabular import LimeTabularExplainer
-from alibi.explainers import AnchorTabular
 
 # =========================
 # CONFIG
@@ -45,15 +44,9 @@ def load_resources():
         mode="classification"
     )
 
-    anchor_explainer = AnchorTabular(
-        predictor=model.predict,
-        feature_names=feature_names
-    )
-    anchor_explainer.fit(X_train_np)
+    return model, feature_names, lime_explainer
 
-    return model, feature_names, lime_explainer, anchor_explainer
-
-model, feature_names, lime_explainer, anchor_explainer = load_resources()
+model, feature_names, lime_explainer = load_resources()
 
 # =========================
 # HEURISTICS
@@ -133,14 +126,8 @@ def predict_and_explain(code):
 
     smart_lime = smart_select_lime(lime_raw, metrics)
 
-    anchor_exp = anchor_explainer.explain(
-        X[0],
-        threshold=0.6,
-        beam_size=5,
-        max_anchor_size=5
-    )
-
-    anchor_rules = anchor_exp.anchor if anchor_exp.anchor else ["No anchor found"]
+    # Anchor removed (not supported on Streamlit Cloud)
+    anchor_rules = ["Anchor explanation not available in cloud version"]
 
     return {
         "prob": prob,
@@ -171,7 +158,7 @@ if file:
             st.write(f"• {item}")
 
     with col2:
-        st.subheader("Anchor + Smart Rules")
+        st.subheader("Rules")
         for rule in res["combined"]:
             st.success(f"✔ {rule}")
 
@@ -194,7 +181,7 @@ if file:
         trust = st.slider("Trust level", 1, 5)
         effort = st.slider("Mental effort", 1, 5)
 
-        preferred = st.radio("Preferred explanation", ["LIME", "Anchor", "Both"])
+        preferred = st.radio("Preferred explanation", ["LIME", "Rules"])
         comments = st.text_area("Comments")
 
         if st.form_submit_button("Submit"):
