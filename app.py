@@ -32,7 +32,7 @@ st.caption(f"Participant ID: {st.session_state.user_id}")
 def load_resources():
     # 🔓 Unzip model if not already extracted
     if not os.path.exists("nasa_model.pkl"):
-        with zipfile.ZipFile("model.zip", 'r') as zip_ref:
+        with zipfile.ZipFile("nasa_model.zip", 'r') as zip_ref:
             zip_ref.extractall()
 
     model = joblib.load("nasa_model.pkl")
