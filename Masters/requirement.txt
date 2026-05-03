@@ -1,0 +1,7 @@
+streamlit
+joblib
+numpy
+pandas
+lime
+alibi
+scikit-learn
