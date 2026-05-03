@@ -5,6 +5,7 @@ import pandas as pd
 import json
 import re
 import os
+import zipfile
 from datetime import datetime
 import uuid
 
@@ -25,10 +26,15 @@ st.title("Software Defect Prediction Explainer")
 st.caption(f"Participant ID: {st.session_state.user_id}")
 
 # =========================
-# LOAD FILES
+# LOAD MODEL + DATA
 # =========================
 @st.cache_resource
 def load_resources():
+    # 🔓 Unzip model if not already extracted
+    if not os.path.exists("nasa_model.pkl"):
+        with zipfile.ZipFile("model.zip", 'r') as zip_ref:
+            zip_ref.extractall()
+
     model = joblib.load("nasa_model.pkl")
 
     with open("nasa_feature_names.json") as f:
@@ -126,14 +132,12 @@ def predict_and_explain(code):
 
     smart_lime = smart_select_lime(lime_raw, metrics)
 
-    # Anchor removed (not supported on Streamlit Cloud)
-    anchor_rules = ["Anchor explanation not available in cloud version"]
+    anchor_rules = ["Anchor not available in cloud version"]
 
     return {
         "prob": prob,
         "severity": "High" if prob > 0.7 else "Medium" if prob > 0.3 else "Low",
         "lime": full_lime_clean,
-        "anchor": anchor_rules,
         "combined": list(set(anchor_rules + smart_lime)),
         "human": generate_human_explanation(smart_lime)
     }
