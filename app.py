@@ -98,12 +98,32 @@ def extract_feature(rule):
     return m.group(1) if m else None
 
 # =========================
-# SMART LIME (FOR LOGIC ONLY)
+# FILTER RANGE RULES (NEW)
+# =========================
+def is_simple_rule(rule: str):
+    """
+    Remove rules like:
+    30 < loc ≤ 109
+    6 < cbo ≤ 12
+    """
+
+    # detect range pattern (two-sided inequality)
+    if re.search(r"\d+(\.\d+)?\s*<\s*\w+\s*[≤<>=]\s*\d+(\.\d+)?", rule):
+        return False
+
+    # extra safety: multiple comparisons
+    if rule.count("<") > 1 or rule.count(">") > 1:
+        return False
+
+    return True
+
+# =========================
+# SMART LIME
 # =========================
 def smart_lime(lime_exp, metrics):
     selected = {}
     for rule, _ in lime_exp:
-        if ("<" in rule and ">" in rule) or (rule.count("<") + rule.count(">") > 1):
+        if not is_simple_rule(rule):
             continue
 
         feat = extract_feature(rule)
@@ -122,23 +142,21 @@ def pseudo_anchor(metrics):
     return anchor
 
 # =========================
-# MERGE (ANCHOR FINAL)
+# MERGE
 # =========================
 def build_anchor_final(anchor, lime):
     final = {}
 
-    # Anchor baseline
     for f, r in anchor.items():
         final[f] = r
 
-    # Override with LIME where available
     for f, r in lime.items():
         final[f] = r
 
     return final
 
 # =========================
-# INTERSECTION (CLEAN)
+# INTERSECTION
 # =========================
 def build_intersection(anchor_final, lime):
     return {
@@ -178,16 +196,18 @@ if file:
     prob = float(model.predict_proba(X)[0][1])
 
     # =========================
-    # FULL LIME (IMPORTANT CHANGE)
+    # LIME (FILTERED)
     # =========================
-    lime_raw = lime_explainer.explain_instance(
-        X[0], model.predict_proba, num_features=20
+    raw = lime_explainer.explain_instance(
+        X[0], model.predict_proba, num_features=30
     ).as_list()
 
-    full_lime = lime_raw  # ALL rules shown
+    lime_raw = [(r, w) for r, w in raw if is_simple_rule(r)]
+
+    full_lime = lime_raw
 
     # =========================
-    # SMART LIME (internal logic)
+    # SMART LIME
     # =========================
     lime_rules = smart_lime(lime_raw, metrics)
 
@@ -213,24 +233,20 @@ if file:
 
     col1, col2 = st.columns(2)
 
-    # FULL LIME
     with col1:
-        st.subheader("LIME (Full Explanation)")
+        st.subheader("LIME (Clean Rules Only)")
         for r, _ in full_lime:
             st.write("•", r)
 
-    # ANCHOR
     with col2:
         st.subheader("Anchor (Dynamic)")
         for r in anchor_final.values():
             st.success(r)
 
-    # INTERSECTION
     st.subheader("Intersection (Key Signal)")
     for r in intersection.values():
         st.warning(r)
 
-    # HUMAN
     st.subheader("Expert Explanation")
     for exp in humanize(intersection):
         st.info(exp)
