@@ -6,3 +6,4 @@ scikit-learn
 lime
 gspread
 google-auth
+alibi==0.9.6
