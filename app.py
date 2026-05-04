@@ -74,12 +74,12 @@ def load_resources():
         mode="classification"
     )
 
-    return model, feature_names, lime, X_np
+    return model, feature_names, lime
 
-model, feature_names, lime_explainer, X_train_np = load_resources()
+model, feature_names, lime_explainer = load_resources()
 
 # =========================
-# HEURISTICS (ANCHOR SUBSTITUTE)
+# THRESHOLDS (ANCHOR SUBSTITUTE)
 # =========================
 THRESHOLDS = {
     "wmc": 12, "rfc": 60, "cbo": 5, "loc": 100,
@@ -87,7 +87,7 @@ THRESHOLDS = {
 }
 
 # =========================
-# FUNCTIONS
+# FEATURE EXTRACTION
 # =========================
 def extract_metrics(code):
     return {
@@ -123,7 +123,7 @@ def smart_lime_filter(lime_exp, metrics):
     return selected
 
 # =========================
-# 🔥 ANCHOR SUBSTITUTE (RULE-BASED)
+# PSEUDO ANCHOR (REPLACEMENT)
 # =========================
 def pseudo_anchor(metrics):
     anchors = []
@@ -139,13 +139,13 @@ def pseudo_anchor(metrics):
 # =========================
 def humanize(rules):
     mapping = {
-        "loc": "High LOC → God Class.",
-        "wmc": "High complexity.",
+        "loc": "High LOC → God Class (hard to maintain).",
+        "wmc": "High complexity in methods.",
         "rfc": "Too many method calls.",
-        "cbo": "High coupling.",
-        "npm": "Too many public methods.",
-        "dit": "Deep inheritance.",
-        "lcom": "Low cohesion."
+        "cbo": "High coupling between classes.",
+        "npm": "Too many public methods exposed.",
+        "dit": "Deep inheritance hierarchy.",
+        "lcom": "Low cohesion inside class."
     }
 
     return list(set(
@@ -166,20 +166,29 @@ if file:
 
     prob = float(model.predict_proba(X)[0][1])
 
+    # =========================
     # LIME
+    # =========================
     lime_raw = lime_explainer.explain_instance(
         X[0], model.predict_proba, num_features=10
     ).as_list()
 
     smart_lime = smart_lime_filter(lime_raw, metrics)
 
-    # 🔥 Anchor substitute
+    # =========================
+    # PSEUDO ANCHOR
+    # =========================
     anchor_rules = pseudo_anchor(metrics)
 
-    # COMBINATION STRATEGIES
+    # =========================
+    # COMBINATIONS
+    # =========================
     union_rules = list(set(anchor_rules + smart_lime))
     intersection_rules = list(set(anchor_rules).intersection(set(smart_lime)))
 
+    # =========================
+    # OUTPUT
+    # =========================
     st.metric("Defect Probability", f"{prob*100:.1f}%")
 
     col1, col2 = st.columns(2)
@@ -187,16 +196,16 @@ if file:
     with col1:
         st.subheader("LIME")
         for r, _ in lime_raw:
-            st.write(r)
+            st.write("•", r)
 
     with col2:
-        st.subheader("Anchor (Simulated) + Smart LIME")
+        st.subheader("Anchor (Pseudo) + Smart LIME")
 
-        st.write("**Union:**")
+        st.write("### Union")
         for r in union_rules:
             st.success(r)
 
-        st.write("**Intersection (your research key):**")
+        st.write("### Intersection (Key Research Signal)")
         for r in intersection_rules:
             st.warning(r)
 
@@ -205,7 +214,7 @@ if file:
         st.info(exp)
 
     # =========================
-    # SURVEY + SAVE
+    # SURVEY + GOOGLE SHEETS
     # =========================
     with st.form("survey"):
 
@@ -214,7 +223,7 @@ if file:
         trust = st.slider("Trust", 1, 5)
         effort = st.slider("Effort", 1, 5)
 
-        preferred = st.radio("Preferred", ["LIME", "Anchor", "Both"])
+        preferred = st.radio("Preferred Explanation", ["LIME", "Anchor", "Both"])
         comments = st.text_area("Comments")
 
         if st.form_submit_button("Submit"):
@@ -237,4 +246,4 @@ if file:
                 sheet.append_row(row)
                 st.success("Saved to Google Sheets ✅")
             except Exception as e:
-                st.error(f"Error: {e}")
+                st.error(f"Error saving: {e}")
