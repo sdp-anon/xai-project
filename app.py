@@ -10,6 +10,10 @@ from datetime import datetime
 import uuid
 from lime.lime_tabular import LimeTabularExplainer
 
+# ✅ NEW: Google Sheets
+import gspread
+from google.oauth2.service_account import Credentials
+
 # =========================
 # CONFIG
 # =========================
@@ -25,21 +29,33 @@ st.title("Software Defect Prediction Explainer")
 st.caption(f"Participant ID: {st.session_state.user_id}")
 
 # =========================
+# GOOGLE SHEETS CONNECTION
+# =========================
+def connect_to_gsheet():
+    creds = Credentials.from_service_account_info(
+        st.secrets["gcp_service_account"],
+        scopes=["https://www.googleapis.com/auth/spreadsheets"]
+    )
+    client = gspread.authorize(creds)
+    return client
+
+def get_sheet():
+    client = connect_to_gsheet()
+    sheet = client.open("YOUR_SHEET_NAME").sheet1  # 🔥 change this
+    return sheet
+
+# =========================
 # LOAD MODEL + DATA
 # =========================
 @st.cache_resource
 def load_resources():
 
-    # -------------------------
-    # FIX: correct zip handling
-    # -------------------------
     zip_path = "nasa_model.zip"
     extract_path = "model_files"
 
     if not os.path.exists(extract_path):
         os.makedirs(extract_path, exist_ok=True)
 
-    # unzip only once
     if os.path.exists(zip_path) and not os.path.exists(f"{extract_path}/nasa_model.pkl"):
         with zipfile.ZipFile(zip_path, "r") as zip_ref:
             zip_ref.extractall(extract_path)
@@ -48,7 +64,6 @@ def load_resources():
     feature_path = f"{extract_path}/nasa_feature_names.json"
     train_path = f"{extract_path}/nasa_X_train.csv"
 
-    # safety checks
     if not os.path.exists(model_path):
         st.error("❌ Model file not found after unzip!")
         st.stop()
@@ -206,9 +221,24 @@ if file:
                 "comments": comments
             }
 
-            df = pd.DataFrame([data])
-            file_path = "survey_results.csv"
+            try:
+                sheet = get_sheet()
 
-            df.to_csv(file_path, mode="a", header=not os.path.exists(file_path), index=False)
+                sheet.append_row([
+                    data["time"],
+                    data["user"],
+                    data["file"],
+                    data["prob"],
+                    data["severity"],
+                    data["clarity"],
+                    data["usefulness"],
+                    data["trust"],
+                    data["effort"],
+                    data["preferred"],
+                    data["comments"]
+                ])
 
-            st.success("Saved ✅")
+                st.success("Saved to Google Sheets")
+
+            except Exception as e:
+                st.error(f"Error saving to Google Sheets: {e}")
