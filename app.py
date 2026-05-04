@@ -8,9 +8,12 @@ import os
 import zipfile
 from datetime import datetime
 import uuid
-from lime.lime_tabular import LimeTabularExplainer
 
-# ✅ Google Sheets
+# XAI
+from lime.lime_tabular import LimeTabularExplainer
+from alibi.explainers import AnchorTabular
+
+# Google Sheets
 import gspread
 from google.oauth2.service_account import Credentials
 
@@ -29,7 +32,7 @@ st.title("Software Defect Prediction Explainer")
 st.caption(f"Participant ID: {st.session_state.user_id}")
 
 # =========================
-# GOOGLE SHEETS CONNECTION
+# GOOGLE SHEETS
 # =========================
 def connect_to_gsheet():
     creds = Credentials.from_service_account_info(
@@ -39,26 +42,13 @@ def connect_to_gsheet():
             "https://www.googleapis.com/auth/drive"
         ]
     )
-    client = gspread.authorize(creds)
-    return client
+    return gspread.authorize(creds)
 
 def get_sheet():
-    client = connect_to_gsheet()
-    sheet = client.open("XAI Survey Results").sheet1
-    return sheet
-
-def ensure_header(sheet):
-    header = [
-        "time","user","file","prob",
-        "clarity","usefulness","trust","effort",
-        "preferred","comments"
-    ]
-    
-    if sheet.row_count == 0 or sheet.row_values(1) != header:
-        sheet.insert_row(header, 1)
+    return connect_to_gsheet().open("XAI Survey Results").sheet1
 
 # =========================
-# LOAD MODEL
+# LOAD MODEL + XAI
 # =========================
 @st.cache_resource
 def load_resources():
@@ -72,37 +62,38 @@ def load_resources():
         with zipfile.ZipFile(zip_path, "r") as zip_ref:
             zip_ref.extractall(extract_path)
 
-    model_path = f"{extract_path}/nasa_model.pkl"
-    feature_path = f"{extract_path}/nasa_feature_names.json"
-    train_path = f"{extract_path}/nasa_X_train.csv"
+    model = joblib.load(f"{extract_path}/nasa_model.pkl")
 
-    if not os.path.exists(model_path):
-        st.error("❌ Model file not found!")
-        st.stop()
-
-    model = joblib.load(model_path)
-
-    with open(feature_path) as f:
+    with open(f"{extract_path}/nasa_feature_names.json") as f:
         feature_names = json.load(f)
 
-    X_train = pd.read_csv(train_path)
-    X_train_np = X_train[feature_names].values
+    X_train = pd.read_csv(f"{extract_path}/nasa_X_train.csv")
+    X_np = X_train[feature_names].values
 
-    lime_explainer = LimeTabularExplainer(
-        X_train_np,
-        feature_names=feature_names,
-        class_names=["clean", "buggy"],
-        mode="classification"
+    lime = LimeTabularExplainer(
+        X_np, feature_names=feature_names,
+        class_names=["clean", "buggy"], mode="classification"
     )
 
-    return model, feature_names, lime_explainer
+    anchor = AnchorTabular(model.predict, feature_names)
+    anchor.fit(X_np)
 
-model, feature_names, lime_explainer = load_resources()
+    return model, feature_names, lime, anchor
+
+model, feature_names, lime_explainer, anchor_explainer = load_resources()
+
+# =========================
+# HEURISTICS
+# =========================
+THRESHOLDS = {
+    "wmc": 12, "rfc": 60, "cbo": 5, "loc": 100,
+    "npm": 10, "dit": 3, "noc": 2, "lcom": 10
+}
 
 # =========================
 # FUNCTIONS
 # =========================
-def extract_metrics(code: str):
+def extract_metrics(code):
     return {
         "wmc": len(re.findall(r"(public|private|protected).*?\(", code)),
         "dit": code.count("extends"),
@@ -116,20 +107,37 @@ def extract_metrics(code: str):
         "loc": len(code.split("\n"))
     }
 
-def prepare_features(metrics):
+def prepare(metrics):
     return np.array([[metrics.get(f, 0) for f in feature_names]])
 
-def predict_and_explain(code):
-    metrics = extract_metrics(code)
-    X = prepare_features(metrics)
+def extract_feature(rule):
+    m = re.search(r"(wmc|dit|noc|cbo|rfc|lcom|ca|ce|npm|loc)", rule)
+    return m.group(1) if m else None
 
-    prob = float(model.predict_proba(X)[0][1])
+def smart_lime_filter(lime_exp, metrics):
+    selected = []
+    for rule, _ in lime_exp:
+        if ("<" in rule and ">" in rule) or (rule.count('<') + rule.count('>') > 1):
+            continue
 
-    lime_raw = lime_explainer.explain_instance(
-        X[0], model.predict_proba, num_features=10
-    ).as_list()
+        feat = extract_feature(rule)
+        if feat in THRESHOLDS and metrics.get(feat, 0) > THRESHOLDS[feat]:
+            selected.append(rule)
 
-    return prob, lime_raw
+    return selected
+
+def humanize(rules):
+    mapping = {
+        "loc": "High LOC → God Class.",
+        "wmc": "High complexity.",
+        "rfc": "Too many method calls.",
+        "cbo": "High coupling.",
+        "npm": "Too many public methods.",
+        "dit": "Deep inheritance.",
+        "lcom": "Low cohesion."
+    }
+
+    return list(set(mapping.get(extract_feature(r), "") for r in rules))
 
 # =========================
 # UI
@@ -138,31 +146,73 @@ file = st.file_uploader("Upload Java File", type=["java"])
 
 if file:
     code = file.read().decode("utf-8")
-    prob, lime = predict_and_explain(code)
+
+    metrics = extract_metrics(code)
+    X = prepare(metrics)
+
+    prob = float(model.predict_proba(X)[0][1])
+
+    # LIME
+    lime_raw = lime_explainer.explain_instance(
+        X[0], model.predict_proba, num_features=10
+    ).as_list()
+
+    smart_lime = smart_lime_filter(lime_raw, metrics)
+
+    # ANCHOR
+    anchor_exp = anchor_explainer.explain(
+        X[0],
+        threshold=0.6,
+        beam_size=5,
+        max_anchor_size=5
+    )
+
+    anchor_rules = anchor_exp.anchor if anchor_exp.anchor else []
+
+    # 🔥 COMBINATION OPTIONS
+    union_rules = list(set(anchor_rules + smart_lime))
+    intersection_rules = list(set(anchor_rules).intersection(set(smart_lime)))
 
     st.metric("Defect Probability", f"{prob*100:.1f}%")
 
-    st.subheader("LIME Explanation")
-    for item in lime:
-        st.write(item)
+    col1, col2 = st.columns(2)
+
+    with col1:
+        st.subheader("LIME")
+        for r, _ in lime_raw:
+            st.write(r)
+
+    with col2:
+        st.subheader("Anchor + Smart LIME")
+
+        st.write("**Union (original):**")
+        for r in union_rules:
+            st.success(r)
+
+        st.write("**Intersection (strict):**")
+        for r in intersection_rules:
+            st.warning(r)
+
+    st.subheader("Expert Explanation")
+    for exp in humanize(smart_lime):
+        st.info(exp)
 
     # =========================
-    # SURVEY
+    # SURVEY + SAVE
     # =========================
     with st.form("survey"):
-        st.subheader("Evaluation")
 
-        clarity = st.slider("Easy to understand", 1, 5)
-        usefulness = st.slider("Helpful for defects", 1, 5)
-        trust = st.slider("Trust level", 1, 5)
-        effort = st.slider("Mental effort", 1, 5)
+        clarity = st.slider("Clarity", 1, 5)
+        usefulness = st.slider("Usefulness", 1, 5)
+        trust = st.slider("Trust", 1, 5)
+        effort = st.slider("Effort", 1, 5)
 
-        preferred = st.radio("Preferred explanation", ["LIME", "Rules"])
+        preferred = st.radio("Preferred", ["LIME", "Anchor", "Both"])
         comments = st.text_area("Comments")
 
         if st.form_submit_button("Submit"):
 
-            data_row = [
+            row = [
                 datetime.now().isoformat(),
                 st.session_state.user_id,
                 file.name,
@@ -177,10 +227,7 @@ if file:
 
             try:
                 sheet = get_sheet()
-                ensure_header(sheet)
-                sheet.append_row(data_row)
-
-                st.success("Saved to Google Sheets ✅")
-
+                sheet.append_row(row)
+                st.success("Saved ✅")
             except Exception as e:
                 st.error(f"Error: {e}")
