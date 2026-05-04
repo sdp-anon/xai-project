@@ -234,19 +234,19 @@ if file:
     col1, col2 = st.columns(2)
 
     with col1:
-        st.subheader("LIME (Clean Rules Only)")
+        st.subheader("LIME")
         for r, _ in full_lime:
             st.write("•", r)
 
     with col2:
-        st.subheader("Anchor (Dynamic)")
+        st.subheader("Anchor")
         for r in anchor_final.values():
             st.success(r)
 
-    st.subheader("Intersection (Key Signal)")
+    st.subheader("Intersection rules")
     for r in intersection.values():
         st.warning(r)
 
-    st.subheader("Expert Explanation")
+    st.subheader("Explanation")
     for exp in humanize(intersection):
         st.info(exp)
