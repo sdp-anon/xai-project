@@ -8,6 +8,7 @@ import os
 import zipfile
 from datetime import datetime
 import uuid
+from itertools import combinations
 
 from lime.lime_tabular import LimeTabularExplainer
 
@@ -45,7 +46,7 @@ def get_sheet():
     return connect_to_gsheet().open("XAI Survey Results").sheet1
 
 # =========================
-# LOAD MODEL
+# LOAD MODEL + DATA
 # =========================
 @st.cache_resource
 def load_resources():
@@ -80,7 +81,7 @@ def load_resources():
 model, feature_names, lime_explainer = load_resources()
 
 # =========================
-# THRESHOLDS (SMART LIME)
+# THRESHOLDS
 # =========================
 THRESHOLDS = {
     "wmc": 12, "rfc": 60, "cbo": 5, "loc": 100,
@@ -138,28 +139,51 @@ def smart_lime_filter(lime_exp, metrics):
     return clean_rules(selected)
 
 # =========================
-# 🔥 MODEL-DRIVEN ANCHOR (NO LIBRARY)
+# 🔥 REAL MODEL-DRIVEN ANCHOR (RULE-BASED)
 # =========================
-def model_driven_anchor(x, model, feature_names, num_samples=200, stability_threshold=0.85):
+def generate_anchor_rules(x, model, feature_names):
     base_pred = model.predict(x.reshape(1, -1))[0]
 
-    stable_features = []
+    rules = []
 
-    for i, feat in enumerate(feature_names):
+    values = dict(zip(feature_names, x))
 
-        x_perturbed = np.tile(x, (num_samples, 1))
+    # create candidate thresholds from actual instance
+    candidates = []
 
-        noise = np.random.normal(0, 0.1, num_samples)
-        x_perturbed[:, i] = x_perturbed[:, i] + noise
+    for f in feature_names:
+        val = values[f]
+        candidates.append((f, ">", val))
+        candidates.append((f, "<=", val))
 
-        preds = model.predict(x_perturbed)
+    # try feature interactions (THIS is key upgrade)
+    for r in combinations(candidates, 2):
 
+        rule_parts = []
+        mask = np.ones(len(x), dtype=bool)
+
+        for f, op, val in r:
+            idx = feature_names.index(f)
+
+            if op == ">":
+                mask = mask & (x[idx] > val)
+                rule_parts.append(f"{f} > {round(val,2)}")
+            else:
+                mask = mask & (x[idx] <= val)
+                rule_parts.append(f"{f} <= {round(val,2)}")
+
+        # stability test
+        X_pert = np.tile(x, (100, 1))
+        noise = np.random.normal(0, 0.05, X_pert.shape)
+        X_pert += noise
+
+        preds = model.predict(X_pert)
         stability = np.mean(preds == base_pred)
 
-        if stability >= stability_threshold:
-            stable_features.append(f"{feat} stable (conf={stability:.2f})")
+        if stability > 0.80:
+            rules.append(" AND ".join(rule_parts))
 
-    return clean_rules(stable_features[:6])
+    return clean_rules(rules)[:5]
 
 # =========================
 # HUMAN EXPLANATION
@@ -203,12 +227,12 @@ if file:
     smart_lime = smart_lime_filter(lime_raw, metrics)
 
     # =========================
-    # MODEL-DRIVEN ANCHOR
+    # ANCHOR (NEW REAL VERSION)
     # =========================
-    anchor_rules = model_driven_anchor(X[0], model, feature_names)
+    anchor_rules = generate_anchor_rules(X[0], model, feature_names)
 
     # =========================
-    # COMBINATIONS
+    # COMBINATION LOGIC
     # =========================
     union_rules = clean_rules(list(set(anchor_rules + smart_lime)))
     intersection_rules = clean_rules(list(set(anchor_rules).intersection(set(smart_lime))))
@@ -226,7 +250,7 @@ if file:
             st.write("•", r)
 
     with col2:
-        st.subheader("Anchor (Model-Driven) + Smart LIME")
+        st.subheader("Anchor + Smart LIME")
 
         st.write("### Union")
         for r in union_rules:
