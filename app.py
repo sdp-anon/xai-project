@@ -8,7 +8,6 @@ import os
 import zipfile
 from datetime import datetime
 import uuid
-from itertools import combinations
 
 from lime.lime_tabular import LimeTabularExplainer
 
@@ -66,7 +65,7 @@ def load_resources():
         feature_names = json.load(f)
 
     X_train = pd.read_csv(f"{extract_path}/nasa_X_train.csv")
-    X_np = X_train[feature_names].values
+    X_np = X_train[feature_names].values.astype(float)
 
     lime = LimeTabularExplainer(
         X_np,
@@ -75,18 +74,9 @@ def load_resources():
         mode="classification"
     )
 
-    return model, feature_names, lime
+    return model, feature_names, lime, X_np
 
-
-model, feature_names, lime_explainer = load_resources()
-
-# =========================
-# THRESHOLDS
-# =========================
-THRESHOLDS = {
-    "wmc": 12, "rfc": 60, "cbo": 5, "loc": 100,
-    "npm": 10, "dit": 3, "noc": 2, "lcom": 10
-}
+model, feature_names, lime_explainer, X_train_np = load_resources()
 
 # =========================
 # FEATURE EXTRACTION
@@ -104,24 +94,11 @@ def extract_metrics(code):
     }
 
 def prepare(metrics):
-    return np.array([[metrics.get(f, 0) for f in feature_names]])
+    return np.array([[metrics.get(f, 0) for f in feature_names]], dtype=float)
 
 def extract_feature(rule):
     m = re.search(r"(wmc|dit|noc|cbo|rfc|lcom|ca|ce|npm|loc)", rule)
     return m.group(1) if m else None
-
-# =========================
-# CLEAN RULES
-# =========================
-def clean_rules(rules):
-    seen = set()
-    out = []
-    for r in rules:
-        r = r.strip()
-        if r not in seen:
-            out.append(r)
-            seen.add(r)
-    return out
 
 # =========================
 # SMART LIME
@@ -129,61 +106,57 @@ def clean_rules(rules):
 def smart_lime_filter(lime_exp, metrics):
     selected = []
     for rule, _ in lime_exp:
-        if ("<" in rule and ">" in rule):
+        if ("<" in rule and ">" in rule) or (rule.count('<') + rule.count('>') > 1):
             continue
 
         feat = extract_feature(rule)
-        if feat in THRESHOLDS and metrics.get(feat, 0) > THRESHOLDS[feat]:
+        if feat and metrics.get(feat, 0) > np.mean(X_train_np[:, feature_names.index(feat)]):
             selected.append(rule)
 
-    return clean_rules(selected)
+    return selected
 
 # =========================
-# 🔥 REAL MODEL-DRIVEN ANCHOR (RULE-BASED)
+# REAL MODEL-DRIVEN ANCHOR (FIXED)
 # =========================
-def generate_anchor_rules(x, model, feature_names):
-    base_pred = model.predict(x.reshape(1, -1))[0]
+def generate_anchor_rules(X, model, feature_names, X_train, n_samples=50):
+    X = np.array(X, dtype=float)
 
-    rules = []
+    original_pred = model.predict(X.reshape(1, -1))[0]
 
-    values = dict(zip(feature_names, x))
+    anchors = []
 
-    # create candidate thresholds from actual instance
-    candidates = []
+    for i, feat in enumerate(feature_names):
 
-    for f in feature_names:
-        val = values[f]
-        candidates.append((f, ">", val))
-        candidates.append((f, "<=", val))
+        train_mean = X_train[:, i].mean()
+        train_std = X_train[:, i].std()
 
-    # try feature interactions (THIS is key upgrade)
-    for r in combinations(candidates, 2):
+        lower = train_mean - train_std
+        upper = train_mean + train_std
 
-        rule_parts = []
-        mask = np.ones(len(x), dtype=bool)
+        stable_count = 0
 
-        for f, op, val in r:
-            idx = feature_names.index(f)
+        for _ in range(n_samples):
+            X_pert = X.copy()
 
-            if op == ">":
-                mask = mask & (x[idx] > val)
-                rule_parts.append(f"{f} > {round(val,2)}")
-            else:
-                mask = mask & (x[idx] <= val)
-                rule_parts.append(f"{f} <= {round(val,2)}")
+            # FIXED NUMPY ERROR (float-safe)
+            noise = np.random.normal(0, train_std * 0.2, size=X.shape)
+            X_pert = X_pert + noise
 
-        # stability test
-        X_pert = np.tile(x, (100, 1))
-        noise = np.random.normal(0, 0.05, X_pert.shape)
-        X_pert += noise
+            pred = model.predict(X_pert.reshape(1, -1))[0]
 
-        preds = model.predict(X_pert)
-        stability = np.mean(preds == base_pred)
+            if pred == original_pred:
+                stable_count += 1
 
-        if stability > 0.80:
-            rules.append(" AND ".join(rule_parts))
+        conf = stable_count / n_samples
 
-    return clean_rules(rules)[:5]
+        # ONLY meaningful anchors
+        if conf > 0.8:
+            if X[i] > upper:
+                anchors.append(f"{feat} > {upper:.2f}")
+            elif X[i] < lower:
+                anchors.append(f"{feat} < {lower:.2f}")
+
+    return anchors
 
 # =========================
 # HUMAN EXPLANATION
@@ -227,15 +200,17 @@ if file:
     smart_lime = smart_lime_filter(lime_raw, metrics)
 
     # =========================
-    # ANCHOR (NEW REAL VERSION)
+    # REAL ANCHOR
     # =========================
-    anchor_rules = generate_anchor_rules(X[0], model, feature_names)
+    anchor_rules = generate_anchor_rules(
+        X[0], model, feature_names, X_train_np
+    )
 
     # =========================
-    # COMBINATION LOGIC
+    # CLEAN COMBINATION (NO DUPLICATES)
     # =========================
-    union_rules = clean_rules(list(set(anchor_rules + smart_lime)))
-    intersection_rules = clean_rules(list(set(anchor_rules).intersection(set(smart_lime))))
+    union_rules = sorted(set(anchor_rules + smart_lime))
+    intersection_rules = sorted(set(anchor_rules).intersection(set(smart_lime)))
 
     # =========================
     # OUTPUT
@@ -250,7 +225,7 @@ if file:
             st.write("•", r)
 
     with col2:
-        st.subheader("Anchor + Smart LIME")
+        st.subheader("Anchor (Model-Driven) + Smart LIME")
 
         st.write("### Union")
         for r in union_rules:
@@ -265,7 +240,7 @@ if file:
         st.info(exp)
 
     # =========================
-    # SURVEY + GOOGLE SHEETS
+    # SURVEY + SAVE
     # =========================
     with st.form("survey"):
 
