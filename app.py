@@ -79,7 +79,26 @@ def load_resources():
 model, feature_names, lime_explainer = load_resources()
 
 # =========================
-# METRICS
+# THRESHOLDS
+# =========================
+THRESHOLDS = {
+    "wmc": 12,
+    "rfc": 60,
+    "cbo": 5,
+    "loc": 100,
+    "npm": 10,
+    "dit": 3,
+    "noc": 2,
+    "lcom3": 0.64,
+    "cbm": 0.0,
+    "amc": 5.60,
+    "ca": 1,
+    "avg_cc": 0.75,
+    "mfa": 0.0
+}
+
+# =========================
+# FEATURE EXTRACTION
 # =========================
 def extract_metrics(code):
     return {
@@ -88,79 +107,111 @@ def extract_metrics(code):
         "noc": code.count("class "),
         "cbo": code.count("import "),
         "rfc": len(re.findall(r"\w+\(", code)),
-        "lcom": code.count("this."),
+        "lcom3": code.count("this."),
+        "cbm": code.count("this."),
+        "amc": len(code.split()) / max(len(code.split("\n")), 1),
         "npm": code.count("public "),
-        "loc": len(code.split("\n"))
+        "loc": len(code.split("\n")),
+        "ca": len(re.findall(r"\w+\(", code)),
+        "avg_cc": len(re.findall(r"if|for|while|switch", code)),
+        "mfa": code.count(".")
     }
 
 def prepare(metrics):
     return np.array([[metrics.get(f, 0) for f in feature_names]])
 
 def extract_feature(rule):
-    m = re.search(r"(wmc|dit|noc|cbo|rfc|lcom|ca|ce|npm|loc)", rule)
+    m = re.search(r"(wmc|npm|loc|cbo|lcom3|cbm|amc|ca|avg_cc|noc|mfa|rfc)", rule)
     return m.group(1) if m else None
 
 # =========================
-# SMART LIME
+# LIME FILTER
 # =========================
 def smart_lime_filter(lime_exp, metrics):
     selected = []
-
     for rule, _ in lime_exp:
-        if ("<" in rule and ">" in rule) or (rule.count("<") + rule.count(">") > 1):
+        if ("<" in rule and ">" in rule) or (rule.count('<') + rule.count('>') > 1):
             continue
 
         feat = extract_feature(rule)
-
-        if feat and metrics.get(feat, 0) > 0:
+        if feat in THRESHOLDS and metrics.get(feat, 0) > THRESHOLDS[feat]:
             selected.append(rule)
-
     return selected
 
 # =========================
-# ⚓ DYNAMIC ANCHOR (NEW)
+# PARSING RULES
 # =========================
-def generate_dynamic_anchor(X_instance, model, feature_names, metrics):
+def parse_rule(rule):
+    match = re.search(r"(wmc|npm|loc|cbo|lcom3|cbm|amc|ca|avg_cc|noc|mfa|rfc)", rule)
+    if not match:
+        return None
 
-    base_pred = model.predict(X_instance.reshape(1, -1))[0]
+    feature = match.group(1)
 
-    rules = {}
+    value_match = re.search(r"([0-9]+\.?[0-9]*)", rule)
+    value = float(value_match.group(1)) if value_match else None
 
-    search_space = np.linspace(0.6, 1.8, 7)
+    return feature, value
 
-    for feat in metrics.keys():
+# =========================
+# NORMALIZATION
+# =========================
+def normalize_lime(lime_rules):
+    lime_map = {}
 
-        if feat not in feature_names:
+    for r, _ in lime_rules:
+        parsed = parse_rule(r)
+        if not parsed:
             continue
 
-        idx = feature_names.index(feat)
-        original = X_instance[idx]
+        f, v = parsed
+        if v is None:
+            continue
 
-        best_score = 0
-        best_rule = None
+        lime_map[f] = min(lime_map.get(f, v), v)
 
-        for scale in search_space:
+    return lime_map
 
-            X_pert = np.repeat(X_instance.reshape(1, -1), 25, axis=0)
+def normalize_anchor(anchor_rules):
+    anchor_map = {}
 
-            noise = np.random.normal(0, 0.08, size=25)
-            X_pert[:, idx] = original * scale * (1 + noise)
+    for r in anchor_rules:
+        parsed = parse_rule(r)
+        if not parsed:
+            continue
 
-            preds = model.predict(X_pert)
+        f, v = parsed
+        if v is not None:
+            anchor_map[f] = v
 
-            stability = np.mean(preds == base_pred)
-            coverage = np.mean(X_pert[:, idx] > original)
+    return anchor_map
 
-            score = stability * coverage
+# =========================
+# FUSION LOGIC
+# =========================
+def fuse_rules(lime_rules, anchor_rules):
 
-            if score > best_score:
-                best_score = score
-                best_rule = f"{feat} > {original * scale:.2f} (conf={score:.2f})"
+    lime_map = normalize_lime(lime_rules)
+    anchor_map = normalize_anchor(anchor_rules)
 
-        if best_rule and best_score > 0.6:
-            rules[feat] = best_rule
+    final_anchor = {}
+    intersection = []
 
-    return list(rules.values())
+    all_features = set(lime_map.keys()).union(anchor_map.keys())
+
+    for f in all_features:
+
+        if f in lime_map and f in anchor_map:
+            final_anchor[f] = min(lime_map[f], anchor_map[f])
+            intersection.append(f)
+
+        elif f in anchor_map:
+            final_anchor[f] = anchor_map[f]
+
+        elif f in lime_map:
+            final_anchor[f] = lime_map[f]
+
+    return final_anchor, intersection
 
 # =========================
 # HUMAN EXPLANATION
@@ -168,18 +219,16 @@ def generate_dynamic_anchor(X_instance, model, feature_names, metrics):
 def humanize(rules):
     mapping = {
         "loc": "High LOC → God Class.",
-        "wmc": "High complexity in methods.",
+        "wmc": "High complexity.",
         "rfc": "Too many method calls.",
         "cbo": "High coupling.",
         "npm": "Too many public methods.",
         "dit": "Deep inheritance.",
-        "lcom": "Low cohesion."
+        "lcom3": "Low cohesion.",
+        "cbm": "Low modularity."
     }
 
-    return list(set(
-        mapping.get(extract_feature(r), "")
-        for r in rules if extract_feature(r)
-    ))
+    return list(set(mapping.get(extract_feature(r), "") for r in rules))
 
 # =========================
 # UI
@@ -195,33 +244,39 @@ if file:
 
     prob = float(model.predict_proba(X)[0][1])
 
-    st.metric("Defect Probability", f"{prob*100:.1f}%")
-
     # =========================
     # LIME
     # =========================
     lime_raw = lime_explainer.explain_instance(
-        X[0],
-        model.predict_proba,
-        num_features=10
+        X[0], model.predict_proba, num_features=10
     ).as_list()
 
     smart_lime = smart_lime_filter(lime_raw, metrics)
 
     # =========================
-    # DYNAMIC ANCHOR
+    # MODEL-DRIVEN ANCHOR (SIMULATED)
     # =========================
-    anchor_rules = generate_dynamic_anchor(X[0], model, feature_names, metrics)
+    anchor_rules = []
+    for f, v in metrics.items():
+        if f in THRESHOLDS and v > THRESHOLDS[f]:
+            anchor_rules.append(f"{f} > {THRESHOLDS[f]}")
 
     # =========================
-    # CLEAN COMBINATION
+    # FUSION
     # =========================
-    union_rules = list(dict.fromkeys(anchor_rules + smart_lime))
-    intersection_rules = list(set(anchor_rules) & set(smart_lime))
+    final_anchor_map, intersection_features = fuse_rules(lime_raw, anchor_rules)
+
+    final_anchor_rules = [
+        f"{f} > {v:.2f}" for f, v in final_anchor_map.items()
+    ]
+
+    intersection_rules = intersection_features
 
     # =========================
-    # DISPLAY
+    # OUTPUT
     # =========================
+    st.metric("Defect Probability", f"{prob*100:.1f}%")
+
     col1, col2 = st.columns(2)
 
     with col1:
@@ -232,31 +287,20 @@ if file:
     with col2:
         st.subheader("Anchor (Dynamic) + Smart LIME")
 
-        st.write("### Anchor (Model-driven)")
-        for r in anchor_rules:
+        st.write("### Anchor (Final)")
+        for r in final_anchor_rules:
             st.success(r)
 
-        st.write("### Smart LIME")
-        for r in smart_lime:
-            st.info(r)
-
-    st.subheader("Combined View")
-
-    st.write("### Union")
-    for r in union_rules:
-        st.write(r)
-
-    st.write("### Intersection")
-    for r in intersection_rules:
-        st.warning(r)
+        st.write("### Intersection (Key Signal)")
+        for r in intersection_rules:
+            st.warning(r)
 
     st.subheader("Expert Explanation")
-
     for exp in humanize(smart_lime):
         st.info(exp)
 
     # =========================
-    # SURVEY → GOOGLE SHEETS
+    # SURVEY + SAVE
     # =========================
     with st.form("survey"):
 
@@ -265,7 +309,7 @@ if file:
         trust = st.slider("Trust", 1, 5)
         effort = st.slider("Effort", 1, 5)
 
-        preferred = st.radio("Preferred Explanation", ["LIME", "Anchor", "Both"])
+        preferred = st.radio("Preferred", ["LIME", "Anchor", "Both"])
         comments = st.text_area("Comments")
 
         if st.form_submit_button("Submit"):
@@ -288,4 +332,4 @@ if file:
                 sheet.append_row(row)
                 st.success("Saved to Google Sheets ✅")
             except Exception as e:
-                st.error(f"Error: {e}")
+                st.error(f"Error saving: {e}")
