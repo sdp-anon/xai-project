@@ -79,21 +79,7 @@ def load_resources():
 model, feature_names, lime_explainer = load_resources()
 
 # =========================
-# THRESHOLDS (SMART ANCHOR)
-# =========================
-THRESHOLDS = {
-    "wmc": 12,
-    "rfc": 60,
-    "cbo": 5,
-    "loc": 100,
-    "npm": 10,
-    "dit": 3,
-    "noc": 2,
-    "lcom": 10
-}
-
-# =========================
-# FEATURE EXTRACTION
+# METRICS
 # =========================
 def extract_metrics(code):
     return {
@@ -115,7 +101,7 @@ def extract_feature(rule):
     return m.group(1) if m else None
 
 # =========================
-# LIME FILTER
+# SMART LIME
 # =========================
 def smart_lime_filter(lime_exp, metrics):
     selected = []
@@ -126,46 +112,55 @@ def smart_lime_filter(lime_exp, metrics):
 
         feat = extract_feature(rule)
 
-        if feat in THRESHOLDS and metrics.get(feat, 0) > THRESHOLDS[feat]:
+        if feat and metrics.get(feat, 0) > 0:
             selected.append(rule)
 
     return selected
 
 # =========================
-# MODEL-DRIVEN ANCHOR (FIXED + STABLE)
+# ⚓ DYNAMIC ANCHOR (NEW)
 # =========================
-def generate_anchor_rules(X_instance, model, feature_names, metrics):
-    rules = []
+def generate_dynamic_anchor(X_instance, model, feature_names, metrics):
 
     base_pred = model.predict(X_instance.reshape(1, -1))[0]
 
-    important_feats = list(set([
-        extract_feature(f"{k} > 0") for k in metrics.keys()
-    ]))
+    rules = {}
 
-    important_feats = [f for f in important_feats if f in feature_names]
+    search_space = np.linspace(0.6, 1.8, 7)
 
-    if not important_feats:
-        return ["No anchor signals"]
+    for feat in metrics.keys():
 
-    num_samples = 25  # optimized speed
+        if feat not in feature_names:
+            continue
 
-    for feat in important_feats:
         idx = feature_names.index(feat)
+        original = X_instance[idx]
 
-        X_pert = np.repeat(X_instance.reshape(1, -1), num_samples, axis=0).astype(float)
+        best_score = 0
+        best_rule = None
 
-        noise = np.random.normal(0, 0.05, size=num_samples)
-        X_pert[:, idx] = X_pert[:, idx] * (1 + noise)
+        for scale in search_space:
 
-        preds = model.predict(X_pert)
+            X_pert = np.repeat(X_instance.reshape(1, -1), 25, axis=0)
 
-        stability = np.mean(preds == base_pred)
+            noise = np.random.normal(0, 0.08, size=25)
+            X_pert[:, idx] = original * scale * (1 + noise)
 
-        if stability > 0.80:
-            rules.append(f"{feat} stable (conf={stability:.2f})")
+            preds = model.predict(X_pert)
 
-    return rules
+            stability = np.mean(preds == base_pred)
+            coverage = np.mean(X_pert[:, idx] > original)
+
+            score = stability * coverage
+
+            if score > best_score:
+                best_score = score
+                best_rule = f"{feat} > {original * scale:.2f} (conf={score:.2f})"
+
+        if best_rule and best_score > 0.6:
+            rules[feat] = best_rule
+
+    return list(rules.values())
 
 # =========================
 # HUMAN EXPLANATION
@@ -183,7 +178,7 @@ def humanize(rules):
 
     return list(set(
         mapping.get(extract_feature(r), "")
-        for r in rules if extract_feature(r) in mapping
+        for r in rules if extract_feature(r)
     ))
 
 # =========================
@@ -214,12 +209,12 @@ if file:
     smart_lime = smart_lime_filter(lime_raw, metrics)
 
     # =========================
-    # ANCHOR (MODEL-DRIVEN)
+    # DYNAMIC ANCHOR
     # =========================
-    anchor_rules = generate_anchor_rules(X[0], model, feature_names, metrics)
+    anchor_rules = generate_dynamic_anchor(X[0], model, feature_names, metrics)
 
     # =========================
-    # CLEAN COMBINATION (NO DUPLICATES)
+    # CLEAN COMBINATION
     # =========================
     union_rules = list(dict.fromkeys(anchor_rules + smart_lime))
     intersection_rules = list(set(anchor_rules) & set(smart_lime))
@@ -235,9 +230,9 @@ if file:
             st.write("•", r)
 
     with col2:
-        st.subheader("Anchor (Model-Driven) + Smart LIME")
+        st.subheader("Anchor (Dynamic) + Smart LIME")
 
-        st.write("### Anchor")
+        st.write("### Anchor (Model-driven)")
         for r in anchor_rules:
             st.success(r)
 
@@ -245,13 +240,13 @@ if file:
         for r in smart_lime:
             st.info(r)
 
-    st.subheader("Combined Signal")
+    st.subheader("Combined View")
 
-    st.write("**Union**")
+    st.write("### Union")
     for r in union_rules:
         st.write(r)
 
-    st.write("**Intersection (Key Signal)**")
+    st.write("### Intersection")
     for r in intersection_rules:
         st.warning(r)
 
@@ -261,7 +256,7 @@ if file:
         st.info(exp)
 
     # =========================
-    # SURVEY + GOOGLE SHEETS
+    # SURVEY → GOOGLE SHEETS
     # =========================
     with st.form("survey"):
 
