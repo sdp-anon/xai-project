@@ -240,7 +240,7 @@ if file:
     with col2:
         st.subheader("Anchor")
 
-        st.write("### Union")
+       
         for r in union_rules:
             st.success(r)
 
