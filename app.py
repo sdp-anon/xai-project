@@ -94,7 +94,9 @@ THRESHOLDS = {
     "amc": 5.60,
     "ca": 1,
     "avg_cc": 0.75,
-    "mfa": 0.0
+    "mfa": 0.0,
+    "cam": 0.29,
+    "dam": 0.0
 }
 
 # =========================
@@ -114,14 +116,16 @@ def extract_metrics(code):
         "loc": len(code.split("\n")),
         "ca": len(re.findall(r"\w+\(", code)),
         "avg_cc": len(re.findall(r"if|for|while|switch", code)),
-        "mfa": code.count(".")
+        "mfa": code.count("."),
+        "cam": len(re.findall(r"\w+\(", code)) / max(len(code.split("\n")), 1),
+        "dam": code.count("private")
     }
 
 def prepare(metrics):
     return np.array([[metrics.get(f, 0) for f in feature_names]])
 
 def extract_feature(rule):
-    m = re.search(r"(wmc|npm|loc|cbo|lcom3|cbm|amc|ca|avg_cc|noc|mfa|rfc)", rule)
+    m = re.search(r"(wmc|npm|loc|cbo|lcom3|cbm|amc|ca|avg_cc|noc|mfa|rfc|cam|dam)", rule)
     return m.group(1) if m else None
 
 # =========================
@@ -130,7 +134,7 @@ def extract_feature(rule):
 def smart_lime_filter(lime_exp, metrics):
     selected = []
     for rule, _ in lime_exp:
-        if ("<" in rule and ">" in rule) or (rule.count('<') + rule.count('>') > 1):
+        if ("<" in rule and ">" in rule) or (rule.count('<') > 1 or rule.count('>') > 1):
             continue
 
         feat = extract_feature(rule)
@@ -139,79 +143,62 @@ def smart_lime_filter(lime_exp, metrics):
     return selected
 
 # =========================
-# PARSING RULES
+# PARSE RULE
 # =========================
 def parse_rule(rule):
-    match = re.search(r"(wmc|npm|loc|cbo|lcom3|cbm|amc|ca|avg_cc|noc|mfa|rfc)", rule)
-    if not match:
+    m = re.search(r"(wmc|npm|loc|cbo|lcom3|cbm|amc|ca|avg_cc|noc|mfa|rfc|cam|dam)", rule)
+    if not m:
         return None
 
-    feature = match.group(1)
+    feature = m.group(1)
 
-    value_match = re.search(r"([0-9]+\.?[0-9]*)", rule)
-    value = float(value_match.group(1)) if value_match else None
+    val = re.search(r"([0-9]+\.?[0-9]*)", rule)
+    value = float(val.group(1)) if val else None
 
-    return feature, value
+    direction = ">" if ">" in rule else "<" if "<" in rule else None
+
+    return feature, value, direction
 
 # =========================
-# NORMALIZATION
+# STRICT INTERSECTION (FIXED)
 # =========================
-def normalize_lime(lime_rules):
+def strict_intersection(lime_rules, anchor_rules):
+
     lime_map = {}
-
-    for r, _ in lime_rules:
-        parsed = parse_rule(r)
-        if not parsed:
-            continue
-
-        f, v = parsed
-        if v is None:
-            continue
-
-        lime_map[f] = min(lime_map.get(f, v), v)
-
-    return lime_map
-
-def normalize_anchor(anchor_rules):
     anchor_map = {}
 
+    # LIME parsing
+    for r, _ in lime_rules:
+        parsed = parse_rule(r)
+        if parsed:
+            f, v, d = parsed
+            lime_map[f] = d
+
+    # Anchor parsing
     for r in anchor_rules:
         parsed = parse_rule(r)
-        if not parsed:
-            continue
+        if parsed:
+            f, v, d = parsed
+            anchor_map[f] = d
 
-        f, v = parsed
-        if v is not None:
-            anchor_map[f] = v
-
-    return anchor_map
-
-# =========================
-# FUSION LOGIC
-# =========================
-def fuse_rules(lime_rules, anchor_rules):
-
-    lime_map = normalize_lime(lime_rules)
-    anchor_map = normalize_anchor(anchor_rules)
-
-    final_anchor = {}
     intersection = []
 
-    all_features = set(lime_map.keys()).union(anchor_map.keys())
+    for f in lime_map:
+        if f in anchor_map:
+            if lime_map[f] == anchor_map[f]:
+                intersection.append(f)
 
-    for f in all_features:
+    return intersection
 
-        if f in lime_map and f in anchor_map:
-            final_anchor[f] = min(lime_map[f], anchor_map[f])
-            intersection.append(f)
-
-        elif f in anchor_map:
-            final_anchor[f] = anchor_map[f]
-
-        elif f in lime_map:
-            final_anchor[f] = lime_map[f]
-
-    return final_anchor, intersection
+# =========================
+# MODEL-DRIVEN ANCHOR
+# =========================
+def build_anchor(metrics):
+    rules = []
+    for f, v in metrics.items():
+        if f in THRESHOLDS and v > THRESHOLDS[f]:
+            rules.append(f"{f} > {THRESHOLDS[f]}")
+    return rules
 
 # =========================
 # HUMAN EXPLANATION
@@ -224,10 +211,8 @@ def humanize(rules):
         "cbo": "High coupling.",
         "npm": "Too many public methods.",
         "dit": "Deep inheritance.",
-        "lcom3": "Low cohesion.",
-        "cbm": "Low modularity."
+        "lcom3": "Low cohesion."
     }
-
     return list(set(mapping.get(extract_feature(r), "") for r in rules))
 
 # =========================
@@ -244,37 +229,20 @@ if file:
 
     prob = float(model.predict_proba(X)[0][1])
 
-    # =========================
     # LIME
-    # =========================
     lime_raw = lime_explainer.explain_instance(
         X[0], model.predict_proba, num_features=10
     ).as_list()
 
     smart_lime = smart_lime_filter(lime_raw, metrics)
 
-    # =========================
-    # MODEL-DRIVEN ANCHOR (SIMULATED)
-    # =========================
-    anchor_rules = []
-    for f, v in metrics.items():
-        if f in THRESHOLDS and v > THRESHOLDS[f]:
-            anchor_rules.append(f"{f} > {THRESHOLDS[f]}")
+    # Anchor
+    anchor_rules = build_anchor(metrics)
 
-    # =========================
-    # FUSION
-    # =========================
-    final_anchor_map, intersection_features = fuse_rules(lime_raw, anchor_rules)
+    # Intersection FIXED
+    intersection_rules = strict_intersection(lime_raw, anchor_rules)
 
-    final_anchor_rules = [
-        f"{f} > {v:.2f}" for f, v in final_anchor_map.items()
-    ]
-
-    intersection_rules = intersection_features
-
-    # =========================
     # OUTPUT
-    # =========================
     st.metric("Defect Probability", f"{prob*100:.1f}%")
 
     col1, col2 = st.columns(2)
@@ -285,13 +253,12 @@ if file:
             st.write("•", r)
 
     with col2:
-        st.subheader("Anchor (Dynamic) + Smart LIME")
+        st.subheader("Anchor (Dynamic)")
 
-        st.write("### Anchor (Final)")
-        for r in final_anchor_rules:
+        for r in anchor_rules:
             st.success(r)
 
-        st.write("### Intersection (Key Signal)")
+        st.subheader("Intersection (Clean Agreement)")
         for r in intersection_rules:
             st.warning(r)
 
