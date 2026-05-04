@@ -94,10 +94,11 @@ def extract_metrics(code):
     }
 
 def prepare(metrics):
-    return np.array([[metrics.get(f, 0) for f in feature_names]], dtype=float)
+    ordered = [metrics.get(f, 0) for f in feature_names]
+    return np.array([ordered], dtype=float)
 
 def extract_feature(rule):
-    m = re.search(r"(wmc|dit|noc|cbo|rfc|lcom|ca|ce|npm|loc)", rule)
+    m = re.search(r"(wmc|dit|noc|cbo|rfc|lcom|npm|loc)", rule)
     return m.group(1) if m else None
 
 # =========================
@@ -110,46 +111,48 @@ def smart_lime_filter(lime_exp, metrics):
             continue
 
         feat = extract_feature(rule)
-        if feat and metrics.get(feat, 0) > np.mean(X_train_np[:, feature_names.index(feat)]):
-            selected.append(rule)
+        if feat:
+            idx = feature_names.index(feat)
+            if metrics.get(feat, 0) > np.mean(X_train_np[:, idx]):
+                selected.append(rule)
 
     return selected
 
 # =========================
-# REAL MODEL-DRIVEN ANCHOR (FIXED)
+# MODEL-DRIVEN ANCHOR
 # =========================
-def generate_anchor_rules(X, model, feature_names, X_train, n_samples=50):
+def generate_anchor_rules(X, model, feature_names, X_train, n_samples=40):
     X = np.array(X, dtype=float)
-
     original_pred = model.predict(X.reshape(1, -1))[0]
 
     anchors = []
 
     for i, feat in enumerate(feature_names):
 
-        train_mean = X_train[:, i].mean()
-        train_std = X_train[:, i].std()
+        mean = X_train[:, i].mean()
+        std = X_train[:, i].std()
 
-        lower = train_mean - train_std
-        upper = train_mean + train_std
+        if std == 0:
+            continue
 
-        stable_count = 0
+        lower = mean - std
+        upper = mean + std
+
+        stable = 0
 
         for _ in range(n_samples):
             X_pert = X.copy()
 
-            # FIXED NUMPY ERROR (float-safe)
-            noise = np.random.normal(0, train_std * 0.2, size=X.shape)
-            X_pert = X_pert + noise
+            noise = np.random.normal(0, std * 0.2)
+            X_pert[i] += noise
 
             pred = model.predict(X_pert.reshape(1, -1))[0]
 
             if pred == original_pred:
-                stable_count += 1
+                stable += 1
 
-        conf = stable_count / n_samples
+        conf = stable / n_samples
 
-        # ONLY meaningful anchors
         if conf > 0.8:
             if X[i] > upper:
                 anchors.append(f"{feat} > {upper:.2f}")
@@ -183,64 +186,78 @@ def humanize(rules):
 file = st.file_uploader("Upload Java File", type=["java"])
 
 if file:
+    st.success("File uploaded successfully 🚀")
+
     code = file.read().decode("utf-8")
 
-    metrics = extract_metrics(code)
-    X = prepare(metrics)
+    st.text_area("Code Preview", code, height=200)
 
-    prob = float(model.predict_proba(X)[0][1])
+    try:
+        # =========================
+        # METRICS
+        # =========================
+        metrics = extract_metrics(code)
+        st.write("Metrics:", metrics)
+
+        X = prepare(metrics)
+        st.write("Feature vector shape:", X.shape)
+
+        # =========================
+        # MODEL
+        # =========================
+        prob = float(model.predict_proba(X)[0][1])
+        st.metric("Defect Probability", f"{prob*100:.1f}%")
+
+        # =========================
+        # LIME
+        # =========================
+        lime_raw = lime_explainer.explain_instance(
+            X[0], model.predict_proba, num_features=10
+        ).as_list()
+
+        smart_lime = smart_lime_filter(lime_raw, metrics)
+
+        # =========================
+        # ANCHOR
+        # =========================
+        anchor_rules = generate_anchor_rules(
+            X[0], model, feature_names, X_train_np
+        )
+
+        # =========================
+        # CLEAN RESULTS
+        # =========================
+        union_rules = sorted(set(anchor_rules + smart_lime))
+        intersection_rules = sorted(set(anchor_rules).intersection(set(smart_lime)))
+
+        col1, col2 = st.columns(2)
+
+        with col1:
+            st.subheader("LIME")
+            for r, _ in lime_raw:
+                st.write("•", r)
+
+        with col2:
+            st.subheader("Anchor (Model-Driven) + Smart LIME")
+
+            st.write("### Union")
+            for r in union_rules:
+                st.success(r)
+
+            st.write("### Intersection (Key Signal)")
+            for r in intersection_rules:
+                st.warning(r)
+
+        st.subheader("Expert Explanation")
+        for exp in humanize(smart_lime):
+            st.info(exp)
+
+    except Exception as e:
+        st.error(f"❌ Error during processing: {e}")
+        st.stop()
 
     # =========================
-    # LIME
-    # =========================
-    lime_raw = lime_explainer.explain_instance(
-        X[0], model.predict_proba, num_features=10
-    ).as_list()
-
-    smart_lime = smart_lime_filter(lime_raw, metrics)
-
-    # =========================
-    # REAL ANCHOR
-    # =========================
-    anchor_rules = generate_anchor_rules(
-        X[0], model, feature_names, X_train_np
-    )
-
-    # =========================
-    # CLEAN COMBINATION (NO DUPLICATES)
-    # =========================
-    union_rules = sorted(set(anchor_rules + smart_lime))
-    intersection_rules = sorted(set(anchor_rules).intersection(set(smart_lime)))
-
-    # =========================
-    # OUTPUT
-    # =========================
-    st.metric("Defect Probability", f"{prob*100:.1f}%")
-
-    col1, col2 = st.columns(2)
-
-    with col1:
-        st.subheader("LIME")
-        for r, _ in lime_raw:
-            st.write("•", r)
-
-    with col2:
-        st.subheader("Anchor (Model-Driven) + Smart LIME")
-
-        st.write("### Union")
-        for r in union_rules:
-            st.success(r)
-
-        st.write("### Intersection (Key Signal)")
-        for r in intersection_rules:
-            st.warning(r)
-
-    st.subheader("Expert Explanation")
-    for exp in humanize(smart_lime):
-        st.info(exp)
-
-    # =========================
-    # SURVEY + SAVE
+    # SURVEY
     # =========================
     with st.form("survey"):
 
