@@ -8,11 +8,7 @@ import os
 import zipfile
 from datetime import datetime
 import uuid
-
 from lime.lime_tabular import LimeTabularExplainer
-
-import gspread
-from google.oauth2.service_account import Credentials
 
 # =========================
 # CONFIG
@@ -27,22 +23,6 @@ if "user_id" not in st.session_state:
 
 st.title("Software Defect Prediction Explainer")
 st.caption(f"Participant ID: {st.session_state.user_id}")
-
-# =========================
-# GOOGLE SHEETS
-# =========================
-def connect_to_gsheet():
-    creds = Credentials.from_service_account_info(
-        st.secrets["gcp_service_account"],
-        scopes=[
-            "https://www.googleapis.com/auth/spreadsheets",
-            "https://www.googleapis.com/auth/drive"
-        ]
-    )
-    return gspread.authorize(creds)
-
-def get_sheet():
-    return connect_to_gsheet().open("XAI Survey Results").sheet1
 
 # =========================
 # LOAD MODEL
@@ -76,10 +56,11 @@ def load_resources():
 
     return model, feature_names, lime
 
+
 model, feature_names, lime_explainer = load_resources()
 
 # =========================
-# THRESHOLDS
+# THRESHOLDS (ANCHOR BASE)
 # =========================
 THRESHOLDS = {
     "wmc": 12,
@@ -89,14 +70,9 @@ THRESHOLDS = {
     "npm": 10,
     "dit": 3,
     "noc": 2,
-    "lcom3": 0.64,
-    "cbm": 0.0,
-    "amc": 5.60,
+    "lcom": 10,
     "ca": 1,
-    "avg_cc": 0.75,
-    "mfa": 0.0,
-    "cam": 0.29,
-    "dam": 0.0
+    "avg_cc": 0.75
 }
 
 # =========================
@@ -109,111 +85,88 @@ def extract_metrics(code):
         "noc": code.count("class "),
         "cbo": code.count("import "),
         "rfc": len(re.findall(r"\w+\(", code)),
-        "lcom3": code.count("this."),
-        "cbm": code.count("this."),
-        "amc": len(code.split()) / max(len(code.split("\n")), 1),
+        "lcom": code.count("this."),
         "npm": code.count("public "),
-        "loc": len(code.split("\n")),
-        "ca": len(re.findall(r"\w+\(", code)),
-        "avg_cc": len(re.findall(r"if|for|while|switch", code)),
-        "mfa": code.count("."),
-        "cam": len(re.findall(r"\w+\(", code)) / max(len(code.split("\n")), 1),
-        "dam": code.count("private")
+        "loc": len(code.split("\n"))
     }
 
 def prepare(metrics):
     return np.array([[metrics.get(f, 0) for f in feature_names]])
 
 def extract_feature(rule):
-    m = re.search(r"(wmc|npm|loc|cbo|lcom3|cbm|amc|ca|avg_cc|noc|mfa|rfc|cam|dam)", rule)
+    m = re.search(r"(wmc|dit|noc|cbo|rfc|lcom|ca|ce|npm|loc|avg_cc)", rule)
     return m.group(1) if m else None
 
 # =========================
-# LIME FILTER
+# SMART LIME
 # =========================
-def smart_lime_filter(lime_exp, metrics):
-    selected = []
+def smart_lime(lime_exp, metrics):
+    selected = {}
     for rule, _ in lime_exp:
-        if ("<" in rule and ">" in rule) or (rule.count('<') > 1 or rule.count('>') > 1):
+        if ("<" in rule and ">" in rule) or (rule.count("<") + rule.count(">") > 1):
             continue
 
         feat = extract_feature(rule)
         if feat in THRESHOLDS and metrics.get(feat, 0) > THRESHOLDS[feat]:
-            selected.append(rule)
+            selected[feat] = rule   # avoid duplicates
     return selected
 
 # =========================
-# PARSE RULE
+# PSEUDO ANCHOR
 # =========================
-def parse_rule(rule):
-    m = re.search(r"(wmc|npm|loc|cbo|lcom3|cbm|amc|ca|avg_cc|noc|mfa|rfc|cam|dam)", rule)
-    if not m:
-        return None
-
-    feature = m.group(1)
-
-    val = re.search(r"([0-9]+\.?[0-9]*)", rule)
-    value = float(val.group(1)) if val else None
-
-    direction = ">" if ">" in rule else "<" if "<" in rule else None
-
-    return feature, value, direction
+def pseudo_anchor(metrics):
+    anchor = {}
+    for feat, thr in THRESHOLDS.items():
+        if metrics.get(feat, 0) > thr:
+            anchor[feat] = f"{feat} > {thr}"
+    return anchor
 
 # =========================
-# STRICT INTERSECTION (FIXED)
+# MERGE LOGIC (IMPORTANT)
 # =========================
-def strict_intersection(lime_rules, anchor_rules):
+def build_anchor_final(anchor, lime):
+    final = {}
 
-    lime_map = {}
-    anchor_map = {}
+    # 1. Start with anchor
+    for f, r in anchor.items():
+        final[f] = r
 
-    # LIME parsing
-    for r, _ in lime_rules:
-        parsed = parse_rule(r)
-        if parsed:
-            f, v, d = parsed
-            lime_map[f] = d
+    # 2. Replace with LIME if exists (YOUR RULE)
+    for f, r in lime.items():
+        final[f] = r
 
-    # Anchor parsing
-    for r in anchor_rules:
-        parsed = parse_rule(r)
-        if parsed:
-            f, v, d = parsed
-            anchor_map[f] = d
+    return final
 
-    intersection = []
+# =========================
+# INTERSECTION (FEATURE LEVEL)
+# =========================
+def build_intersection(anchor_final, lime):
+    intersection = {}
 
-    for f in lime_map:
-        if f in anchor_map:
-            if lime_map[f] == anchor_map[f]:
-                intersection.append(f)
+    for f in anchor_final:
+        if f in lime:
+            intersection[f] = lime[f]
 
     return intersection
 
 # =========================
-# MODEL-DRIVEN ANCHOR
-# =========================
-def build_anchor(metrics):
-    rules = []
-    for f, v in metrics.items():
-        if f in THRESHOLDS and v > THRESHOLDS[f]:
-            rules.append(f"{f} > {THRESHOLDS[f]}")
-    return rules
-
-# =========================
 # HUMAN EXPLANATION
 # =========================
-def humanize(rules):
+def humanize(intersection):
     mapping = {
-        "loc": "High LOC → God Class.",
-        "wmc": "High complexity.",
-        "rfc": "Too many method calls.",
-        "cbo": "High coupling.",
-        "npm": "Too many public methods.",
-        "dit": "Deep inheritance.",
-        "lcom3": "Low cohesion."
+        "loc": "The class is very large and hard to maintain.",
+        "wmc": "The class has high method complexity.",
+        "rfc": "Too many method calls increase execution complexity.",
+        "cbo": "High coupling between classes reduces modularity.",
+        "npm": "Too many public methods expose internal logic.",
+        "dit": "Deep inheritance makes behavior hard to follow.",
+        "lcom": "Low cohesion indicates unrelated responsibilities.",
+        "ca": "High coupling to other classes detected."
     }
-    return list(set(mapping.get(extract_feature(r), "") for r in rules))
+
+    return [
+        mapping[f] for f in intersection.keys() if f in mapping
+    ]
 
 # =========================
 # UI
@@ -221,7 +174,6 @@ def humanize(rules):
 file = st.file_uploader("Upload Java File", type=["java"])
 
 if file:
-
     code = file.read().decode("utf-8")
 
     metrics = extract_metrics(code)
@@ -229,74 +181,51 @@ if file:
 
     prob = float(model.predict_proba(X)[0][1])
 
+    # =========================
     # LIME
+    # =========================
     lime_raw = lime_explainer.explain_instance(
         X[0], model.predict_proba, num_features=10
     ).as_list()
 
-    smart_lime = smart_lime_filter(lime_raw, metrics)
+    lime_rules = smart_lime(lime_raw, metrics)
 
-    # Anchor
-    anchor_rules = build_anchor(metrics)
+    # =========================
+    # ANCHOR (PSEUDO)
+    # =========================
+    anchor_rules = pseudo_anchor(metrics)
 
-    # Intersection FIXED
-    intersection_rules = strict_intersection(lime_raw, anchor_rules)
+    # =========================
+    # FINAL ANCHOR (MERGED)
+    # =========================
+    anchor_final = build_anchor_final(anchor_rules, lime_rules)
 
-    # OUTPUT
+    # =========================
+    # INTERSECTION
+    # =========================
+    intersection = build_intersection(anchor_final, lime_rules)
+
+    # =========================
+    # DISPLAY
+    # =========================
     st.metric("Defect Probability", f"{prob*100:.1f}%")
 
     col1, col2 = st.columns(2)
 
     with col1:
         st.subheader("LIME")
-        for r, _ in lime_raw:
+        for r in lime_rules.values():
             st.write("•", r)
 
     with col2:
         st.subheader("Anchor (Dynamic)")
-
-        for r in anchor_rules:
+        for r in anchor_final.values():
             st.success(r)
 
-        st.subheader("Intersection (Clean Agreement)")
-        for r in intersection_rules:
-            st.warning(r)
+    st.subheader("Intersection (Key Signal)")
+    for r in intersection.values():
+        st.warning(r)
 
     st.subheader("Expert Explanation")
-    for exp in humanize(smart_lime):
+    for exp in humanize(intersection):
         st.info(exp)
-
-    # =========================
-    # SURVEY + SAVE
-    # =========================
-    with st.form("survey"):
-
-        clarity = st.slider("Clarity", 1, 5)
-        usefulness = st.slider("Usefulness", 1, 5)
-        trust = st.slider("Trust", 1, 5)
-        effort = st.slider("Effort", 1, 5)
-
-        preferred = st.radio("Preferred", ["LIME", "Anchor", "Both"])
-        comments = st.text_area("Comments")
-
-        if st.form_submit_button("Submit"):
-
-            row = [
-                datetime.now().isoformat(),
-                st.session_state.user_id,
-                file.name,
-                prob,
-                clarity,
-                usefulness,
-                trust,
-                effort,
-                preferred,
-                comments
-            ]
-
-            try:
-                sheet = get_sheet()
-                sheet.append_row(row)
-                st.success("Saved to Google Sheets ✅")
-            except Exception as e:
-                st.error(f"Error saving: {e}")
