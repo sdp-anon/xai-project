@@ -238,7 +238,7 @@ if file:
             st.write("•", r)
 
     with col2:
-        st.subheader("Anchor (Pseudo) + Smart LIME")
+        st.subheader("Anchor")
 
         st.write("### Union")
         for r in union_rules:
