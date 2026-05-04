@@ -10,6 +10,7 @@ from datetime import datetime
 import uuid
 
 from lime.lime_tabular import LimeTabularExplainer
+from alibi.explainers import AnchorTabular
 
 import gspread
 from google.oauth2.service_account import Credentials
@@ -45,14 +46,15 @@ def get_sheet():
     return connect_to_gsheet().open("XAI Survey Results").sheet1
 
 # =========================
-# LOAD MODEL
+# LOAD MODEL + XAI
 # =========================
 @st.cache_resource
 def load_resources():
     zip_path = "nasa_model.zip"
     extract_path = "model_files"
 
-    os.makedirs(extract_path, exist_ok=True)
+    if not os.path.exists(extract_path):
+        os.makedirs(extract_path, exist_ok=True)
 
     if os.path.exists(zip_path) and not os.path.exists(f"{extract_path}/nasa_model.pkl"):
         with zipfile.ZipFile(zip_path, "r") as zip_ref:
@@ -73,12 +75,19 @@ def load_resources():
         mode="classification"
     )
 
-    return model, feature_names, lime
+    anchor = AnchorTabular(
+        predictor=model.predict_proba,
+        feature_names=feature_names
+    )
+    anchor.fit(X_np)
 
-model, feature_names, lime_explainer = load_resources()
+    return model, feature_names, lime, anchor
+
+
+model, feature_names, lime_explainer, anchor_explainer = load_resources()
 
 # =========================
-# THRESHOLDS
+# THRESHOLDS (SMART FILTER)
 # =========================
 THRESHOLDS = {
     "wmc": 12, "rfc": 60, "cbo": 5, "loc": 100,
@@ -103,43 +112,30 @@ def extract_metrics(code):
 def prepare(metrics):
     return np.array([[metrics.get(f, 0) for f in feature_names]])
 
-# =========================
-# RULE NORMALIZATION (CRITICAL FIX)
-# =========================
-def normalize_rule(rule: str):
-    rule = rule.replace(" ", "")
-    rule = re.sub(r"(\d+)\.0+", r"\1", rule)
-    return rule
-
 def extract_feature(rule):
-    m = re.search(r"(wmc|dit|noc|cbo|rfc|lcom|npm|loc|ca|ce|avg_cc|cbm|dam|moa)", rule)
+    m = re.search(r"(wmc|dit|noc|cbo|rfc|lcom|ca|ce|npm|loc)", rule)
     return m.group(1) if m else None
 
 # =========================
-# CLEAN DUPLICATES (KEY FIX)
+# CLEANING (NO DUPLICATES)
 # =========================
-def clean_rules(rule_list):
+def clean_rules(rules):
     seen = set()
-    cleaned = []
-
-    for r in rule_list:
-        r = normalize_rule(r)
-        feat = extract_feature(r)
-
-        if feat and feat not in seen:
-            seen.add(feat)
-            cleaned.append(r)
-
-    return cleaned
+    out = []
+    for r in rules:
+        r = r.strip()
+        if r not in seen:
+            out.append(r)
+            seen.add(r)
+    return out
 
 # =========================
 # SMART LIME
 # =========================
 def smart_lime_filter(lime_exp, metrics):
     selected = []
-
     for rule, _ in lime_exp:
-        if ("<" in rule and ">" in rule) or (rule.count('<') + rule.count('>') > 1):
+        if ("<" in rule and ">" in rule):
             continue
 
         feat = extract_feature(rule)
@@ -149,16 +145,17 @@ def smart_lime_filter(lime_exp, metrics):
     return clean_rules(selected)
 
 # =========================
-# PSEUDO ANCHOR (CLEAN)
+# REAL ANCHOR (ALIBI)
 # =========================
-def pseudo_anchor(metrics):
-    anchors = []
+def get_anchor(x):
+    exp = anchor_explainer.explain(
+        x,
+        threshold=0.95,
+        beam_size=10,
+        max_anchor_size=5
+    )
 
-    for feat, th in THRESHOLDS.items():
-        if metrics.get(feat, 0) > th:
-            anchors.append(f"{feat} > {th}")
-
-    return clean_rules(anchors) if anchors else ["No strong anchor conditions"]
+    return clean_rules(exp.anchor if exp.anchor else ["No strong anchor found"])
 
 # =========================
 # HUMAN EXPLANATION
@@ -176,7 +173,7 @@ def humanize(rules):
 
     return list(set(
         mapping.get(extract_feature(r), "")
-        for r in rules if extract_feature(r)
+        for r in rules if extract_feature(r) in mapping
     ))
 
 # =========================
@@ -202,28 +199,15 @@ if file:
     smart_lime = smart_lime_filter(lime_raw, metrics)
 
     # =========================
-    # ANCHOR (PSEUDO)
+    # ANCHOR (REAL)
     # =========================
-    anchor_rules = pseudo_anchor(metrics)
-
-    # CLEAN BOTH BEFORE COMBINATION
-    anchor_rules = clean_rules(anchor_rules)
-    smart_lime = clean_rules(smart_lime)
+    anchor_rules = get_anchor(X[0])
 
     # =========================
     # COMBINATION
     # =========================
-    union_rules = clean_rules(anchor_rules + smart_lime)
-
-    anchor_feats = {extract_feature(r) for r in anchor_rules}
-    lime_feats = {extract_feature(r) for r in smart_lime}
-
-    common_feats = anchor_feats.intersection(lime_feats)
-
-    intersection_rules = clean_rules([
-        r for r in union_rules
-        if extract_feature(r) in common_feats
-    ])
+    union_rules = clean_rules(list(set(anchor_rules + smart_lime)))
+    intersection_rules = clean_rules(list(set(anchor_rules).intersection(set(smart_lime))))
 
     # =========================
     # OUTPUT
@@ -238,13 +222,13 @@ if file:
             st.write("•", r)
 
     with col2:
-        st.subheader("Anchor")
+        st.subheader("Anchor + Smart LIME")
 
-       
+        st.write("### Union")
         for r in union_rules:
             st.success(r)
 
-        st.write("### Intersection (Key Signal)")
+        st.write("### Intersection")
         for r in intersection_rules:
             st.warning(r)
 
@@ -253,7 +237,7 @@ if file:
         st.info(exp)
 
     # =========================
-    # SURVEY + GOOGLE SHEETS
+    # SURVEY
     # =========================
     with st.form("survey"):
 
