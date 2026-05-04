@@ -61,11 +61,12 @@ def load_resources():
 model, feature_names, lime_explainer = load_resources()
 
 # =========================
-# VALID FEATURES (IMPORTANT FIX)
+# VALID FEATURES
 # =========================
 VALID_FEATURES = {
     "wmc", "rfc", "cbo", "loc",
-    "npm", "dit", "noc", "lcom"
+    "npm", "dit", "noc", "lcom",
+    "ca", "avg_cc"
 }
 
 # =========================
@@ -87,11 +88,11 @@ def prepare(metrics):
     return np.array([[metrics.get(f, 0) for f in feature_names]])
 
 def extract_feature(rule):
-    m = re.search(r"(wmc|dit|noc|cbo|rfc|lcom|npm|loc)", rule)
+    m = re.search(r"(wmc|dit|noc|cbo|rfc|lcom|npm|loc|ca|avg_cc)", rule)
     return m.group(1) if m else None
 
 # =========================
-# LIME CLEANING (KEEP ALL SIMPLE RULES)
+# FILTER LIME RULES
 # =========================
 def clean_lime(lime_exp):
     cleaned = []
@@ -102,12 +103,12 @@ def clean_lime(lime_exp):
     return cleaned
 
 # =========================
-# DYNAMIC ANCHOR (MODEL-DRIVEN)
+# DYNAMIC ANCHOR (IMPROVED)
 # =========================
-def dynamic_anchor(X, model, feature_names, num_samples=200, noise_level=0.15):
-    base_pred = model.predict(X.reshape(1, -1))[0]
+def dynamic_anchor(X, model, feature_names, num_samples=250, noise_level=0.12):
 
-    importance = {f: 0 for f in feature_names}
+    base_pred = model.predict(X.reshape(1, -1))[0]
+    importance = {f: 0.0 for f in feature_names}
 
     for _ in range(num_samples):
         X_pert = X.copy()
@@ -124,21 +125,25 @@ def dynamic_anchor(X, model, feature_names, num_samples=200, noise_level=0.15):
     for k in importance:
         importance[k] /= num_samples
 
-    sorted_feats = sorted(importance.items(), key=lambda x: x[1], reverse=True)
+    values = np.array(list(importance.values()))
+
+    # 🔥 LOWER = MORE FEATURES
+    threshold = np.percentile(values, 55)
 
     anchor = {
         f: f"{f} (stability={round(score,2)})"
-        for f, score in sorted_feats[:6]
-        if f in VALID_FEATURES
+        for f, score in importance.items()
+        if score >= threshold and f in VALID_FEATURES
     }
 
     return anchor
 
 # =========================
-# INTERSECTION (TRUE AGREEMENT)
+# INTERSECTION
 # =========================
 def build_intersection(anchor, lime):
     lime_feats = {f for _, _, f in lime}
+
     return {
         f: anchor[f]
         for f in anchor
@@ -152,11 +157,13 @@ def humanize(intersection):
     mapping = {
         "loc": "Large class size increases complexity.",
         "wmc": "High method complexity increases defect risk.",
-        "rfc": "Too many method calls increase runtime complexity.",
+        "rfc": "Too many method calls increase execution cost.",
         "cbo": "High coupling reduces modularity.",
         "npm": "Too many public methods expose internal logic.",
-        "dit": "Deep inheritance reduces understandability.",
-        "lcom": "Low cohesion indicates poor design."
+        "dit": "Deep inheritance increases complexity.",
+        "lcom": "Low cohesion indicates poor design.",
+        "ca": "High external dependencies detected.",
+        "avg_cc": "High control flow complexity."
     }
 
     return [mapping[f] for f in intersection if f in mapping]
@@ -178,13 +185,15 @@ if file:
     # LIME
     # =========================
     lime_raw = lime_explainer.explain_instance(
-        X[0], model.predict_proba, num_features=30
+        X[0],
+        model.predict_proba,
+        num_features=30
     ).as_list()
 
     lime_clean = clean_lime(lime_raw)
 
     # =========================
-    # ANCHOR (DYNAMIC)
+    # ANCHOR
     # =========================
     anchor = dynamic_anchor(X[0], model, feature_names)
 
@@ -214,6 +223,6 @@ if file:
     for r in intersection.values():
         st.warning(r)
 
-    st.subheader("Expert Explanation")
+    st.subheader("Explanation")
     for exp in humanize(intersection):
         st.info(exp)
