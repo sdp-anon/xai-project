@@ -9,11 +9,8 @@ import zipfile
 from datetime import datetime
 import uuid
 
-# XAI
 from lime.lime_tabular import LimeTabularExplainer
-from alibi.explainers import AnchorTabular
 
-# Google Sheets
 import gspread
 from google.oauth2.service_account import Credentials
 
@@ -48,7 +45,7 @@ def get_sheet():
     return connect_to_gsheet().open("XAI Survey Results").sheet1
 
 # =========================
-# LOAD MODEL + XAI
+# LOAD MODEL
 # =========================
 @st.cache_resource
 def load_resources():
@@ -71,19 +68,18 @@ def load_resources():
     X_np = X_train[feature_names].values
 
     lime = LimeTabularExplainer(
-        X_np, feature_names=feature_names,
-        class_names=["clean", "buggy"], mode="classification"
+        X_np,
+        feature_names=feature_names,
+        class_names=["clean", "buggy"],
+        mode="classification"
     )
 
-    anchor = AnchorTabular(model.predict, feature_names)
-    anchor.fit(X_np)
+    return model, feature_names, lime, X_np
 
-    return model, feature_names, lime, anchor
-
-model, feature_names, lime_explainer, anchor_explainer = load_resources()
+model, feature_names, lime_explainer, X_train_np = load_resources()
 
 # =========================
-# HEURISTICS
+# HEURISTICS (ANCHOR SUBSTITUTE)
 # =========================
 THRESHOLDS = {
     "wmc": 12, "rfc": 60, "cbo": 5, "loc": 100,
@@ -101,8 +97,6 @@ def extract_metrics(code):
         "cbo": code.count("import "),
         "rfc": len(re.findall(r"\w+\(", code)),
         "lcom": code.count("this."),
-        "ca": len(re.findall(r"\w+\(", code)),
-        "ce": code.count("import "),
         "npm": code.count("public "),
         "loc": len(code.split("\n"))
     }
@@ -114,6 +108,9 @@ def extract_feature(rule):
     m = re.search(r"(wmc|dit|noc|cbo|rfc|lcom|ca|ce|npm|loc)", rule)
     return m.group(1) if m else None
 
+# =========================
+# SMART LIME
+# =========================
 def smart_lime_filter(lime_exp, metrics):
     selected = []
     for rule, _ in lime_exp:
@@ -123,9 +120,23 @@ def smart_lime_filter(lime_exp, metrics):
         feat = extract_feature(rule)
         if feat in THRESHOLDS and metrics.get(feat, 0) > THRESHOLDS[feat]:
             selected.append(rule)
-
     return selected
 
+# =========================
+# 🔥 ANCHOR SUBSTITUTE (RULE-BASED)
+# =========================
+def pseudo_anchor(metrics):
+    anchors = []
+
+    for feat, threshold in THRESHOLDS.items():
+        if metrics.get(feat, 0) > threshold:
+            anchors.append(f"{feat} > {threshold}")
+
+    return anchors if anchors else ["No strong anchor conditions"]
+
+# =========================
+# HUMAN EXPLANATION
+# =========================
 def humanize(rules):
     mapping = {
         "loc": "High LOC → God Class.",
@@ -137,7 +148,10 @@ def humanize(rules):
         "lcom": "Low cohesion."
     }
 
-    return list(set(mapping.get(extract_feature(r), "") for r in rules))
+    return list(set(
+        mapping.get(extract_feature(r), "")
+        for r in rules if extract_feature(r) in mapping
+    ))
 
 # =========================
 # UI
@@ -159,17 +173,10 @@ if file:
 
     smart_lime = smart_lime_filter(lime_raw, metrics)
 
-    # ANCHOR
-    anchor_exp = anchor_explainer.explain(
-        X[0],
-        threshold=0.6,
-        beam_size=5,
-        max_anchor_size=5
-    )
+    # 🔥 Anchor substitute
+    anchor_rules = pseudo_anchor(metrics)
 
-    anchor_rules = anchor_exp.anchor if anchor_exp.anchor else []
-
-    # 🔥 COMBINATION OPTIONS
+    # COMBINATION STRATEGIES
     union_rules = list(set(anchor_rules + smart_lime))
     intersection_rules = list(set(anchor_rules).intersection(set(smart_lime)))
 
@@ -183,13 +190,13 @@ if file:
             st.write(r)
 
     with col2:
-        st.subheader("Anchor + Smart LIME")
+        st.subheader("Anchor (Simulated) + Smart LIME")
 
-        st.write("**Union (original):**")
+        st.write("**Union:**")
         for r in union_rules:
             st.success(r)
 
-        st.write("**Intersection (strict):**")
+        st.write("**Intersection (your research key):**")
         for r in intersection_rules:
             st.warning(r)
 
@@ -228,6 +235,6 @@ if file:
             try:
                 sheet = get_sheet()
                 sheet.append_row(row)
-                st.success("Saved ✅")
+                st.success("Saved to Google Sheets ✅")
             except Exception as e:
                 st.error(f"Error: {e}")
