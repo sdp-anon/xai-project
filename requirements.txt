@@ -4,7 +4,7 @@ pandas
 joblib
 scikit-learn
 lime
-alibi
+alibi==0.9.6
 gspread
 google-auth
 google-auth-oauthlib
