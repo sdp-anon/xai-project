@@ -41,7 +41,7 @@ def connect_to_gsheet():
 
 def get_sheet():
     client = connect_to_gsheet()
-    sheet = client.open("YOUR_SHEET_NAME").sheet1  # 🔥 change this
+    sheet = client.open("XAI Survey Results").sheet1  # 🔥 change this
     return sheet
 
 # =========================
