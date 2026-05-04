@@ -8,6 +8,7 @@ import os
 import zipfile
 from datetime import datetime
 import uuid
+
 from lime.lime_tabular import LimeTabularExplainer
 
 # =========================
@@ -60,19 +61,11 @@ def load_resources():
 model, feature_names, lime_explainer = load_resources()
 
 # =========================
-# THRESHOLDS
+# VALID FEATURES (IMPORTANT FIX)
 # =========================
-THRESHOLDS = {
-    "wmc": 12,
-    "rfc": 60,
-    "cbo": 5,
-    "loc": 100,
-    "npm": 10,
-    "dit": 3,
-    "noc": 2,
-    "lcom": 10,
-    "ca": 1,
-    "avg_cc": 0.75
+VALID_FEATURES = {
+    "wmc", "rfc", "cbo", "loc",
+    "npm", "dit", "noc", "lcom"
 }
 
 # =========================
@@ -94,75 +87,62 @@ def prepare(metrics):
     return np.array([[metrics.get(f, 0) for f in feature_names]])
 
 def extract_feature(rule):
-    m = re.search(r"(wmc|dit|noc|cbo|rfc|lcom|ca|ce|npm|loc|avg_cc)", rule)
+    m = re.search(r"(wmc|dit|noc|cbo|rfc|lcom|npm|loc)", rule)
     return m.group(1) if m else None
 
 # =========================
-# FILTER RANGE RULES (NEW)
+# LIME CLEANING (KEEP ALL SIMPLE RULES)
 # =========================
-def is_simple_rule(rule: str):
-    """
-    Remove rules like:
-    30 < loc ≤ 109
-    6 < cbo ≤ 12
-    """
-
-    # detect range pattern (two-sided inequality)
-    if re.search(r"\d+(\.\d+)?\s*<\s*\w+\s*[≤<>=]\s*\d+(\.\d+)?", rule):
-        return False
-
-    # extra safety: multiple comparisons
-    if rule.count("<") > 1 or rule.count(">") > 1:
-        return False
-
-    return True
-
-# =========================
-# SMART LIME
-# =========================
-def smart_lime(lime_exp, metrics):
-    selected = {}
-    for rule, _ in lime_exp:
-        if not is_simple_rule(rule):
-            continue
-
+def clean_lime(lime_exp):
+    cleaned = []
+    for rule, weight in lime_exp:
         feat = extract_feature(rule)
-        if feat in THRESHOLDS and metrics.get(feat, 0) > THRESHOLDS[feat]:
-            selected[feat] = rule
-    return selected
+        if feat in VALID_FEATURES:
+            cleaned.append((rule, weight, feat))
+    return cleaned
 
 # =========================
-# PSEUDO ANCHOR
+# DYNAMIC ANCHOR (MODEL-DRIVEN)
 # =========================
-def pseudo_anchor(metrics):
-    anchor = {}
-    for feat, thr in THRESHOLDS.items():
-        if metrics.get(feat, 0) > thr:
-            anchor[feat] = f"{feat} > {thr}"
+def dynamic_anchor(X, model, feature_names, num_samples=200, noise_level=0.15):
+    base_pred = model.predict(X.reshape(1, -1))[0]
+
+    importance = {f: 0 for f in feature_names}
+
+    for _ in range(num_samples):
+        X_pert = X.copy()
+        noise = np.random.normal(0, noise_level, size=X.shape)
+        X_pert = X_pert + noise
+
+        pred = model.predict(X_pert.reshape(1, -1))[0]
+
+        if pred == base_pred:
+            for i, f in enumerate(feature_names):
+                importance[f] += abs(noise[i])
+
+    # normalize
+    for k in importance:
+        importance[k] /= num_samples
+
+    sorted_feats = sorted(importance.items(), key=lambda x: x[1], reverse=True)
+
+    anchor = {
+        f: f"{f} (stability={round(score,2)})"
+        for f, score in sorted_feats[:6]
+        if f in VALID_FEATURES
+    }
+
     return anchor
 
 # =========================
-# MERGE
+# INTERSECTION (TRUE AGREEMENT)
 # =========================
-def build_anchor_final(anchor, lime):
-    final = {}
-
-    for f, r in anchor.items():
-        final[f] = r
-
-    for f, r in lime.items():
-        final[f] = r
-
-    return final
-
-# =========================
-# INTERSECTION
-# =========================
-def build_intersection(anchor_final, lime):
+def build_intersection(anchor, lime):
+    lime_feats = {f for _, _, f in lime}
     return {
-        f: lime[f]
-        for f in anchor_final.keys()
-        if f in lime
+        f: anchor[f]
+        for f in anchor
+        if f in lime_feats
     }
 
 # =========================
@@ -170,14 +150,13 @@ def build_intersection(anchor_final, lime):
 # =========================
 def humanize(intersection):
     mapping = {
-        "loc": "The class is very large and hard to maintain.",
+        "loc": "Large class size increases complexity.",
         "wmc": "High method complexity increases defect risk.",
-        "rfc": "Too many method calls increase execution complexity.",
+        "rfc": "Too many method calls increase runtime complexity.",
         "cbo": "High coupling reduces modularity.",
-        "npm": "Too many public methods expose internal design.",
-        "dit": "Deep inheritance hierarchy makes behavior unclear.",
-        "lcom": "Low cohesion indicates poor class design.",
-        "ca": "High coupling with other classes detected."
+        "npm": "Too many public methods expose internal logic.",
+        "dit": "Deep inheritance reduces understandability.",
+        "lcom": "Low cohesion indicates poor design."
     }
 
     return [mapping[f] for f in intersection if f in mapping]
@@ -196,35 +175,23 @@ if file:
     prob = float(model.predict_proba(X)[0][1])
 
     # =========================
-    # LIME (FILTERED)
+    # LIME
     # =========================
-    raw = lime_explainer.explain_instance(
+    lime_raw = lime_explainer.explain_instance(
         X[0], model.predict_proba, num_features=30
     ).as_list()
 
-    lime_raw = [(r, w) for r, w in raw if is_simple_rule(r)]
-
-    full_lime = lime_raw
+    lime_clean = clean_lime(lime_raw)
 
     # =========================
-    # SMART LIME
+    # ANCHOR (DYNAMIC)
     # =========================
-    lime_rules = smart_lime(lime_raw, metrics)
-
-    # =========================
-    # ANCHOR
-    # =========================
-    anchor_rules = pseudo_anchor(metrics)
-
-    # =========================
-    # FINAL ANCHOR
-    # =========================
-    anchor_final = build_anchor_final(anchor_rules, lime_rules)
+    anchor = dynamic_anchor(X[0], model, feature_names)
 
     # =========================
     # INTERSECTION
     # =========================
-    intersection = build_intersection(anchor_final, lime_rules)
+    intersection = build_intersection(anchor, lime_clean)
 
     # =========================
     # OUTPUT
@@ -234,19 +201,19 @@ if file:
     col1, col2 = st.columns(2)
 
     with col1:
-        st.subheader("LIME")
-        for r, _ in full_lime:
+        st.subheader("LIME (Full)")
+        for r, w, f in lime_clean:
             st.write("•", r)
 
     with col2:
-        st.subheader("Anchor")
-        for r in anchor_final.values():
+        st.subheader("Anchor (Dynamic Model-Based)")
+        for r in anchor.values():
             st.success(r)
 
-    st.subheader("Intersection rules")
+    st.subheader("Intersection (Agreement Signal)")
     for r in intersection.values():
         st.warning(r)
 
-    st.subheader("Explanation")
+    st.subheader("Expert Explanation")
     for exp in humanize(intersection):
         st.info(exp)
