@@ -10,6 +10,7 @@ from datetime import datetime
 import uuid
 
 from lime.lime_tabular import LimeTabularExplainer
+from alibi.explainers import AnchorTabular
 
 import gspread
 from google.oauth2.service_account import Credentials
@@ -45,15 +46,14 @@ def get_sheet():
     return connect_to_gsheet().open("XAI Survey Results").sheet1
 
 # =========================
-# LOAD MODEL
+# LOAD MODEL + XAI
 # =========================
 @st.cache_resource
 def load_resources():
     zip_path = "nasa_model.zip"
     extract_path = "model_files"
 
-    if not os.path.exists(extract_path):
-        os.makedirs(extract_path, exist_ok=True)
+    os.makedirs(extract_path, exist_ok=True)
 
     if os.path.exists(zip_path) and not os.path.exists(f"{extract_path}/nasa_model.pkl"):
         with zipfile.ZipFile(zip_path, "r") as zip_ref:
@@ -74,12 +74,15 @@ def load_resources():
         mode="classification"
     )
 
-    return model, feature_names, lime
+    anchor = AnchorTabular(model.predict, feature_names)
+    anchor.fit(X_np)
 
-model, feature_names, lime_explainer = load_resources()
+    return model, feature_names, lime, anchor
+
+model, feature_names, lime_explainer, anchor_explainer = load_resources()
 
 # =========================
-# THRESHOLDS (ANCHOR SUBSTITUTE)
+# THRESHOLDS
 # =========================
 THRESHOLDS = {
     "wmc": 12, "rfc": 60, "cbo": 5, "loc": 100,
@@ -87,7 +90,7 @@ THRESHOLDS = {
 }
 
 # =========================
-# FEATURE EXTRACTION
+# UTILITIES
 # =========================
 def extract_metrics(code):
     return {
@@ -97,6 +100,8 @@ def extract_metrics(code):
         "cbo": code.count("import "),
         "rfc": len(re.findall(r"\w+\(", code)),
         "lcom": code.count("this."),
+        "ca": len(re.findall(r"\w+\(", code)),
+        "ce": code.count("import "),
         "npm": code.count("public "),
         "loc": len(code.split("\n"))
     }
@@ -109,7 +114,39 @@ def extract_feature(rule):
     return m.group(1) if m else None
 
 # =========================
-# SMART LIME
+# CLEANING FUNCTIONS (IMPORTANT FIX)
+# =========================
+def normalize_rule(rule: str):
+    rule = rule.replace(" ", "")
+    rule = re.sub(r"(\d+)\.0+", r"\1", rule)
+    return rule
+
+def extract_feature_value(rule):
+    feature = extract_feature(rule)
+    nums = re.findall(r"(\d+\.?\d*)", rule)
+    value = float(nums[0]) if nums else None
+    return feature, value
+
+def clean_anchor_rules(anchor_rules):
+    best = {}
+    for r in anchor_rules:
+        r = normalize_rule(r)
+        f, _ = extract_feature_value(r)
+        if f and f not in best:
+            best[f] = r
+    return list(best.values())
+
+def clean_smart_lime(smart_lime):
+    best = {}
+    for r in smart_lime:
+        r = normalize_rule(r)
+        f, _ = extract_feature_value(r)
+        if f and f not in best:
+            best[f] = r
+    return list(best.values())
+
+# =========================
+# SMART LIME FILTER
 # =========================
 def smart_lime_filter(lime_exp, metrics):
     selected = []
@@ -120,38 +157,24 @@ def smart_lime_filter(lime_exp, metrics):
         feat = extract_feature(rule)
         if feat in THRESHOLDS and metrics.get(feat, 0) > THRESHOLDS[feat]:
             selected.append(rule)
+
     return selected
-
-# =========================
-# PSEUDO ANCHOR (REPLACEMENT)
-# =========================
-def pseudo_anchor(metrics):
-    anchors = []
-
-    for feat, threshold in THRESHOLDS.items():
-        if metrics.get(feat, 0) > threshold:
-            anchors.append(f"{feat} > {threshold}")
-
-    return anchors if anchors else ["No strong anchor conditions"]
 
 # =========================
 # HUMAN EXPLANATION
 # =========================
 def humanize(rules):
     mapping = {
-        "loc": "High LOC → God Class (hard to maintain).",
-        "wmc": "High complexity in methods.",
+        "loc": "High LOC → God Class.",
+        "wmc": "High complexity.",
         "rfc": "Too many method calls.",
-        "cbo": "High coupling between classes.",
-        "npm": "Too many public methods exposed.",
-        "dit": "Deep inheritance hierarchy.",
-        "lcom": "Low cohesion inside class."
+        "cbo": "High coupling.",
+        "npm": "Too many public methods.",
+        "dit": "Deep inheritance.",
+        "lcom": "Low cohesion."
     }
 
-    return list(set(
-        mapping.get(extract_feature(r), "")
-        for r in rules if extract_feature(r) in mapping
-    ))
+    return list(set(mapping.get(extract_feature(r), "") for r in rules if extract_feature(r)))
 
 # =========================
 # UI
@@ -166,25 +189,31 @@ if file:
 
     prob = float(model.predict_proba(X)[0][1])
 
-    # =========================
     # LIME
-    # =========================
     lime_raw = lime_explainer.explain_instance(
         X[0], model.predict_proba, num_features=10
     ).as_list()
 
-    smart_lime = smart_lime_filter(lime_raw, metrics)
+    smart_lime = clean_smart_lime(smart_lime_filter(lime_raw, metrics))
 
-    # =========================
-    # PSEUDO ANCHOR
-    # =========================
-    anchor_rules = pseudo_anchor(metrics)
+    # ANCHOR
+    anchor_exp = anchor_explainer.explain(
+        X[0],
+        threshold=0.6,
+        beam_size=5,
+        max_anchor_size=5
+    )
 
-    # =========================
+    raw_anchor = anchor_exp.anchor if anchor_exp.anchor else []
+    anchor_rules = clean_anchor_rules(raw_anchor)
+
     # COMBINATIONS
-    # =========================
-    union_rules = list(set(anchor_rules + smart_lime))
-    intersection_rules = list(set(anchor_rules).intersection(set(smart_lime)))
+    union_rules = clean_anchor_rules(anchor_rules + smart_lime)
+
+    intersection_rules = [
+        r for r in union_rules
+        if extract_feature(r) in [extract_feature(s) for s in smart_lime]
+    ]
 
     # =========================
     # OUTPUT
@@ -196,16 +225,16 @@ if file:
     with col1:
         st.subheader("LIME")
         for r, _ in lime_raw:
-            st.write("•", r)
+            st.write(r)
 
     with col2:
-        st.subheader("Anchor (Pseudo) + Smart LIME")
+        st.subheader("Anchor (Clean) + Smart LIME")
 
         st.write("### Union")
         for r in union_rules:
             st.success(r)
 
-        st.write("### Intersection (Key Research Signal)")
+        st.write("### Intersection")
         for r in intersection_rules:
             st.warning(r)
 
@@ -214,7 +243,7 @@ if file:
         st.info(exp)
 
     # =========================
-    # SURVEY + GOOGLE SHEETS
+    # SURVEY
     # =========================
     with st.form("survey"):
 
@@ -223,7 +252,7 @@ if file:
         trust = st.slider("Trust", 1, 5)
         effort = st.slider("Effort", 1, 5)
 
-        preferred = st.radio("Preferred Explanation", ["LIME", "Anchor", "Both"])
+        preferred = st.radio("Preferred", ["LIME", "Anchor", "Both"])
         comments = st.text_area("Comments")
 
         if st.form_submit_button("Submit"):
@@ -246,4 +275,4 @@ if file:
                 sheet.append_row(row)
                 st.success("Saved to Google Sheets ✅")
             except Exception as e:
-                st.error(f"Error saving: {e}")
+                st.error(f"Error: {e}")
