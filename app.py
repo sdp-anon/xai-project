@@ -60,7 +60,7 @@ def load_resources():
 model, feature_names, lime_explainer = load_resources()
 
 # =========================
-# THRESHOLDS (ANCHOR BASE)
+# THRESHOLDS
 # =========================
 THRESHOLDS = {
     "wmc": 12,
@@ -98,7 +98,7 @@ def extract_feature(rule):
     return m.group(1) if m else None
 
 # =========================
-# SMART LIME
+# SMART LIME (FOR LOGIC ONLY)
 # =========================
 def smart_lime(lime_exp, metrics):
     selected = {}
@@ -108,7 +108,7 @@ def smart_lime(lime_exp, metrics):
 
         feat = extract_feature(rule)
         if feat in THRESHOLDS and metrics.get(feat, 0) > THRESHOLDS[feat]:
-            selected[feat] = rule   # avoid duplicates
+            selected[feat] = rule
     return selected
 
 # =========================
@@ -122,32 +122,30 @@ def pseudo_anchor(metrics):
     return anchor
 
 # =========================
-# MERGE LOGIC (IMPORTANT)
+# MERGE (ANCHOR FINAL)
 # =========================
 def build_anchor_final(anchor, lime):
     final = {}
 
-    # 1. Start with anchor
+    # Anchor baseline
     for f, r in anchor.items():
         final[f] = r
 
-    # 2. Replace with LIME if exists (YOUR RULE)
+    # Override with LIME where available
     for f, r in lime.items():
         final[f] = r
 
     return final
 
 # =========================
-# INTERSECTION (FEATURE LEVEL)
+# INTERSECTION (CLEAN)
 # =========================
 def build_intersection(anchor_final, lime):
-    intersection = {}
-
-    for f in anchor_final:
-        if f in lime:
-            intersection[f] = lime[f]
-
-    return intersection
+    return {
+        f: lime[f]
+        for f in anchor_final.keys()
+        if f in lime
+    }
 
 # =========================
 # HUMAN EXPLANATION
@@ -155,18 +153,16 @@ def build_intersection(anchor_final, lime):
 def humanize(intersection):
     mapping = {
         "loc": "The class is very large and hard to maintain.",
-        "wmc": "The class has high method complexity.",
+        "wmc": "High method complexity increases defect risk.",
         "rfc": "Too many method calls increase execution complexity.",
-        "cbo": "High coupling between classes reduces modularity.",
-        "npm": "Too many public methods expose internal logic.",
-        "dit": "Deep inheritance makes behavior hard to follow.",
-        "lcom": "Low cohesion indicates unrelated responsibilities.",
-        "ca": "High coupling to other classes detected."
+        "cbo": "High coupling reduces modularity.",
+        "npm": "Too many public methods expose internal design.",
+        "dit": "Deep inheritance hierarchy makes behavior unclear.",
+        "lcom": "Low cohesion indicates poor class design.",
+        "ca": "High coupling with other classes detected."
     }
 
-    return [
-        mapping[f] for f in intersection.keys() if f in mapping
-    ]
+    return [mapping[f] for f in intersection if f in mapping]
 
 # =========================
 # UI
@@ -182,21 +178,26 @@ if file:
     prob = float(model.predict_proba(X)[0][1])
 
     # =========================
-    # LIME
+    # FULL LIME (IMPORTANT CHANGE)
     # =========================
     lime_raw = lime_explainer.explain_instance(
-        X[0], model.predict_proba, num_features=10
+        X[0], model.predict_proba, num_features=20
     ).as_list()
 
+    full_lime = lime_raw  # ALL rules shown
+
+    # =========================
+    # SMART LIME (internal logic)
+    # =========================
     lime_rules = smart_lime(lime_raw, metrics)
 
     # =========================
-    # ANCHOR (PSEUDO)
+    # ANCHOR
     # =========================
     anchor_rules = pseudo_anchor(metrics)
 
     # =========================
-    # FINAL ANCHOR (MERGED)
+    # FINAL ANCHOR
     # =========================
     anchor_final = build_anchor_final(anchor_rules, lime_rules)
 
@@ -206,26 +207,30 @@ if file:
     intersection = build_intersection(anchor_final, lime_rules)
 
     # =========================
-    # DISPLAY
+    # OUTPUT
     # =========================
     st.metric("Defect Probability", f"{prob*100:.1f}%")
 
     col1, col2 = st.columns(2)
 
+    # FULL LIME
     with col1:
-        st.subheader("LIME")
-        for r in lime_rules.values():
+        st.subheader("LIME (Full Explanation)")
+        for r, _ in full_lime:
             st.write("•", r)
 
+    # ANCHOR
     with col2:
         st.subheader("Anchor (Dynamic)")
         for r in anchor_final.values():
             st.success(r)
 
+    # INTERSECTION
     st.subheader("Intersection (Key Signal)")
     for r in intersection.values():
         st.warning(r)
 
+    # HUMAN
     st.subheader("Expert Explanation")
     for exp in humanize(intersection):
         st.info(exp)
