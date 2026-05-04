@@ -10,7 +10,7 @@ from datetime import datetime
 import uuid
 
 from lime.lime_tabular import LimeTabularExplainer
-from alibi.explainers import AnchorTabular
+
 
 import gspread
 from google.oauth2.service_account import Credentials
