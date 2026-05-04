@@ -10,7 +10,6 @@ from datetime import datetime
 import uuid
 
 from lime.lime_tabular import LimeTabularExplainer
-from alibi.explainers import AnchorTabular
 
 import gspread
 from google.oauth2.service_account import Credentials
@@ -46,7 +45,7 @@ def get_sheet():
     return connect_to_gsheet().open("XAI Survey Results").sheet1
 
 # =========================
-# LOAD MODEL + XAI
+# LOAD MODEL
 # =========================
 @st.cache_resource
 def load_resources():
@@ -75,19 +74,13 @@ def load_resources():
         mode="classification"
     )
 
-    anchor = AnchorTabular(
-        predictor=model.predict_proba,
-        feature_names=feature_names
-    )
-    anchor.fit(X_np)
-
-    return model, feature_names, lime, anchor
+    return model, feature_names, lime
 
 
-model, feature_names, lime_explainer, anchor_explainer = load_resources()
+model, feature_names, lime_explainer = load_resources()
 
 # =========================
-# THRESHOLDS (SMART FILTER)
+# THRESHOLDS (SMART LIME)
 # =========================
 THRESHOLDS = {
     "wmc": 12, "rfc": 60, "cbo": 5, "loc": 100,
@@ -117,7 +110,7 @@ def extract_feature(rule):
     return m.group(1) if m else None
 
 # =========================
-# CLEANING (NO DUPLICATES)
+# CLEAN RULES
 # =========================
 def clean_rules(rules):
     seen = set()
@@ -145,17 +138,28 @@ def smart_lime_filter(lime_exp, metrics):
     return clean_rules(selected)
 
 # =========================
-# REAL ANCHOR (ALIBI)
+# 🔥 MODEL-DRIVEN ANCHOR (NO LIBRARY)
 # =========================
-def get_anchor(x):
-    exp = anchor_explainer.explain(
-        x,
-        threshold=0.95,
-        beam_size=10,
-        max_anchor_size=5
-    )
+def model_driven_anchor(x, model, feature_names, num_samples=200, stability_threshold=0.85):
+    base_pred = model.predict(x.reshape(1, -1))[0]
 
-    return clean_rules(exp.anchor if exp.anchor else ["No strong anchor found"])
+    stable_features = []
+
+    for i, feat in enumerate(feature_names):
+
+        x_perturbed = np.tile(x, (num_samples, 1))
+
+        noise = np.random.normal(0, 0.1, num_samples)
+        x_perturbed[:, i] = x_perturbed[:, i] + noise
+
+        preds = model.predict(x_perturbed)
+
+        stability = np.mean(preds == base_pred)
+
+        if stability >= stability_threshold:
+            stable_features.append(f"{feat} stable (conf={stability:.2f})")
+
+    return clean_rules(stable_features[:6])
 
 # =========================
 # HUMAN EXPLANATION
@@ -199,12 +203,12 @@ if file:
     smart_lime = smart_lime_filter(lime_raw, metrics)
 
     # =========================
-    # ANCHOR (REAL)
+    # MODEL-DRIVEN ANCHOR
     # =========================
-    anchor_rules = get_anchor(X[0])
+    anchor_rules = model_driven_anchor(X[0], model, feature_names)
 
     # =========================
-    # COMBINATION
+    # COMBINATIONS
     # =========================
     union_rules = clean_rules(list(set(anchor_rules + smart_lime)))
     intersection_rules = clean_rules(list(set(anchor_rules).intersection(set(smart_lime))))
@@ -222,13 +226,13 @@ if file:
             st.write("•", r)
 
     with col2:
-        st.subheader("Anchor + Smart LIME")
+        st.subheader("Anchor (Model-Driven) + Smart LIME")
 
         st.write("### Union")
         for r in union_rules:
             st.success(r)
 
-        st.write("### Intersection")
+        st.write("### Intersection (Key Signal)")
         for r in intersection_rules:
             st.warning(r)
 
@@ -237,7 +241,7 @@ if file:
         st.info(exp)
 
     # =========================
-    # SURVEY
+    # SURVEY + GOOGLE SHEETS
     # =========================
     with st.form("survey"):
 
