@@ -103,70 +103,62 @@ def extract_metrics(code):
 def prepare(metrics):
     return np.array([[metrics.get(f, 0) for f in feature_names]])
 
-def extract_feature(rule):
-    m = re.search(r"(wmc|dit|noc|cbo|rfc|lcom|npm|loc)", rule)
-    return m.group(1) if m else None
-
 # =========================
-# CLEAN RULE NORMALIZATION (NEW FIX)
+# RULE NORMALIZATION (CRITICAL FIX)
 # =========================
-def normalize(rule):
+def normalize_rule(rule: str):
     rule = rule.replace(" ", "")
     rule = re.sub(r"(\d+)\.0+", r"\1", rule)
     return rule
 
-def extract_value(rule):
-    nums = re.findall(r"(\d+\.?\d*)", rule)
-    return float(nums[0]) if nums else None
+def extract_feature(rule):
+    m = re.search(r"(wmc|dit|noc|cbo|rfc|lcom|npm|loc|ca|ce|avg_cc|cbm|dam|moa)", rule)
+    return m.group(1) if m else None
+
+# =========================
+# CLEAN DUPLICATES (KEY FIX)
+# =========================
+def clean_rules(rule_list):
+    seen = set()
+    cleaned = []
+
+    for r in rule_list:
+        r = normalize_rule(r)
+        feat = extract_feature(r)
+
+        if feat and feat not in seen:
+            seen.add(feat)
+            cleaned.append(r)
+
+    return cleaned
 
 # =========================
 # SMART LIME
 # =========================
 def smart_lime_filter(lime_exp, metrics):
     selected = []
-    for rule, _ in lime_exp:
 
+    for rule, _ in lime_exp:
         if ("<" in rule and ">" in rule) or (rule.count('<') + rule.count('>') > 1):
             continue
 
         feat = extract_feature(rule)
         if feat in THRESHOLDS and metrics.get(feat, 0) > THRESHOLDS[feat]:
-            selected.append(normalize(rule))
+            selected.append(rule)
 
-    # 🔥 KEEP ONLY 1 RULE PER FEATURE
-    best = {}
-    for r in selected:
-        f = extract_feature(r)
-        if f and f not in best:
-            best[f] = r
-
-    return list(best.values())
+    return clean_rules(selected)
 
 # =========================
-# PSEUDO ANCHOR (CLEANED)
+# PSEUDO ANCHOR (CLEAN)
 # =========================
 def pseudo_anchor(metrics):
-    anchors = {}
+    anchors = []
 
     for feat, th in THRESHOLDS.items():
         if metrics.get(feat, 0) > th:
-            anchors[feat] = f"{feat} > {th}"
+            anchors.append(f"{feat} > {th}")
 
-    return list(anchors.values()) if anchors else ["No strong anchor conditions"]
-
-# =========================
-# INTERSECTION (FIXED LOGIC)
-# =========================
-def intersection(anchor, lime):
-    anchor_feats = {extract_feature(r) for r in anchor}
-    lime_feats = {extract_feature(r) for r in lime}
-
-    common = anchor_feats.intersection(lime_feats)
-
-    return [
-        r for r in anchor + lime
-        if extract_feature(r) in common
-    ]
+    return clean_rules(anchors) if anchors else ["No strong anchor conditions"]
 
 # =========================
 # HUMAN EXPLANATION
@@ -184,7 +176,7 @@ def humanize(rules):
 
     return list(set(
         mapping.get(extract_feature(r), "")
-        for r in rules if extract_feature(r) in mapping
+        for r in rules if extract_feature(r)
     ))
 
 # =========================
@@ -200,19 +192,38 @@ if file:
 
     prob = float(model.predict_proba(X)[0][1])
 
+    # =========================
     # LIME
+    # =========================
     lime_raw = lime_explainer.explain_instance(
         X[0], model.predict_proba, num_features=10
     ).as_list()
 
     smart_lime = smart_lime_filter(lime_raw, metrics)
 
+    # =========================
     # ANCHOR (PSEUDO)
+    # =========================
     anchor_rules = pseudo_anchor(metrics)
 
-    # COMBINATIONS
-    union_rules = list(set(anchor_rules + smart_lime))
-    intersection_rules = intersection(anchor_rules, smart_lime)
+    # CLEAN BOTH BEFORE COMBINATION
+    anchor_rules = clean_rules(anchor_rules)
+    smart_lime = clean_rules(smart_lime)
+
+    # =========================
+    # COMBINATION
+    # =========================
+    union_rules = clean_rules(anchor_rules + smart_lime)
+
+    anchor_feats = {extract_feature(r) for r in anchor_rules}
+    lime_feats = {extract_feature(r) for r in smart_lime}
+
+    common_feats = anchor_feats.intersection(lime_feats)
+
+    intersection_rules = clean_rules([
+        r for r in union_rules
+        if extract_feature(r) in common_feats
+    ])
 
     # =========================
     # OUTPUT
@@ -242,7 +253,7 @@ if file:
         st.info(exp)
 
     # =========================
-    # SURVEY + SAVE
+    # SURVEY + GOOGLE SHEETS
     # =========================
     with st.form("survey"):
 
