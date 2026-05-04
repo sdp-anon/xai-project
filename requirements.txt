@@ -1,9 +1,11 @@
 streamlit
-joblib
 numpy
 pandas
+joblib
 scikit-learn
 lime
+alibi
 gspread
 google-auth
-
+google-auth-oauthlib
+google-auth-httplib2
