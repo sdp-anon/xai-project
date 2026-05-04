@@ -11,7 +11,6 @@ import uuid
 
 from lime.lime_tabular import LimeTabularExplainer
 
-
 import gspread
 from google.oauth2.service_account import Credentials
 
@@ -46,7 +45,7 @@ def get_sheet():
     return connect_to_gsheet().open("XAI Survey Results").sheet1
 
 # =========================
-# LOAD MODEL + XAI
+# LOAD MODEL
 # =========================
 @st.cache_resource
 def load_resources():
@@ -74,12 +73,9 @@ def load_resources():
         mode="classification"
     )
 
-    anchor = AnchorTabular(model.predict, feature_names)
-    anchor.fit(X_np)
+    return model, feature_names, lime
 
-    return model, feature_names, lime, anchor
-
-model, feature_names, lime_explainer, anchor_explainer = load_resources()
+model, feature_names, lime_explainer = load_resources()
 
 # =========================
 # THRESHOLDS
@@ -90,7 +86,7 @@ THRESHOLDS = {
 }
 
 # =========================
-# UTILITIES
+# FEATURE EXTRACTION
 # =========================
 def extract_metrics(code):
     return {
@@ -100,8 +96,6 @@ def extract_metrics(code):
         "cbo": code.count("import "),
         "rfc": len(re.findall(r"\w+\(", code)),
         "lcom": code.count("this."),
-        "ca": len(re.findall(r"\w+\(", code)),
-        "ce": code.count("import "),
         "npm": code.count("public "),
         "loc": len(code.split("\n"))
     }
@@ -110,55 +104,69 @@ def prepare(metrics):
     return np.array([[metrics.get(f, 0) for f in feature_names]])
 
 def extract_feature(rule):
-    m = re.search(r"(wmc|dit|noc|cbo|rfc|lcom|ca|ce|npm|loc)", rule)
+    m = re.search(r"(wmc|dit|noc|cbo|rfc|lcom|npm|loc)", rule)
     return m.group(1) if m else None
 
 # =========================
-# CLEANING FUNCTIONS (IMPORTANT FIX)
+# CLEAN RULE NORMALIZATION (NEW FIX)
 # =========================
-def normalize_rule(rule: str):
+def normalize(rule):
     rule = rule.replace(" ", "")
     rule = re.sub(r"(\d+)\.0+", r"\1", rule)
     return rule
 
-def extract_feature_value(rule):
-    feature = extract_feature(rule)
+def extract_value(rule):
     nums = re.findall(r"(\d+\.?\d*)", rule)
-    value = float(nums[0]) if nums else None
-    return feature, value
-
-def clean_anchor_rules(anchor_rules):
-    best = {}
-    for r in anchor_rules:
-        r = normalize_rule(r)
-        f, _ = extract_feature_value(r)
-        if f and f not in best:
-            best[f] = r
-    return list(best.values())
-
-def clean_smart_lime(smart_lime):
-    best = {}
-    for r in smart_lime:
-        r = normalize_rule(r)
-        f, _ = extract_feature_value(r)
-        if f and f not in best:
-            best[f] = r
-    return list(best.values())
+    return float(nums[0]) if nums else None
 
 # =========================
-# SMART LIME FILTER
+# SMART LIME
 # =========================
 def smart_lime_filter(lime_exp, metrics):
     selected = []
     for rule, _ in lime_exp:
+
         if ("<" in rule and ">" in rule) or (rule.count('<') + rule.count('>') > 1):
             continue
 
         feat = extract_feature(rule)
         if feat in THRESHOLDS and metrics.get(feat, 0) > THRESHOLDS[feat]:
-            selected.append(rule)
+            selected.append(normalize(rule))
 
-    return selected
+    # 🔥 KEEP ONLY 1 RULE PER FEATURE
+    best = {}
+    for r in selected:
+        f = extract_feature(r)
+        if f and f not in best:
+            best[f] = r
+
+    return list(best.values())
+
+# =========================
+# PSEUDO ANCHOR (CLEANED)
+# =========================
+def pseudo_anchor(metrics):
+    anchors = {}
+
+    for feat, th in THRESHOLDS.items():
+        if metrics.get(feat, 0) > th:
+            anchors[feat] = f"{feat} > {th}"
+
+    return list(anchors.values()) if anchors else ["No strong anchor conditions"]
+
+# =========================
+# INTERSECTION (FIXED LOGIC)
+# =========================
+def intersection(anchor, lime):
+    anchor_feats = {extract_feature(r) for r in anchor}
+    lime_feats = {extract_feature(r) for r in lime}
+
+    common = anchor_feats.intersection(lime_feats)
+
+    return [
+        r for r in anchor + lime
+        if extract_feature(r) in common
+    ]
 
 # =========================
 # HUMAN EXPLANATION
@@ -174,7 +182,10 @@ def humanize(rules):
         "lcom": "Low cohesion."
     }
 
-    return list(set(mapping.get(extract_feature(r), "") for r in rules if extract_feature(r)))
+    return list(set(
+        mapping.get(extract_feature(r), "")
+        for r in rules if extract_feature(r) in mapping
+    ))
 
 # =========================
 # UI
@@ -194,26 +205,14 @@ if file:
         X[0], model.predict_proba, num_features=10
     ).as_list()
 
-    smart_lime = clean_smart_lime(smart_lime_filter(lime_raw, metrics))
+    smart_lime = smart_lime_filter(lime_raw, metrics)
 
-    # ANCHOR
-    anchor_exp = anchor_explainer.explain(
-        X[0],
-        threshold=0.6,
-        beam_size=5,
-        max_anchor_size=5
-    )
-
-    raw_anchor = anchor_exp.anchor if anchor_exp.anchor else []
-    anchor_rules = clean_anchor_rules(raw_anchor)
+    # ANCHOR (PSEUDO)
+    anchor_rules = pseudo_anchor(metrics)
 
     # COMBINATIONS
-    union_rules = clean_anchor_rules(anchor_rules + smart_lime)
-
-    intersection_rules = [
-        r for r in union_rules
-        if extract_feature(r) in [extract_feature(s) for s in smart_lime]
-    ]
+    union_rules = list(set(anchor_rules + smart_lime))
+    intersection_rules = intersection(anchor_rules, smart_lime)
 
     # =========================
     # OUTPUT
@@ -225,16 +224,16 @@ if file:
     with col1:
         st.subheader("LIME")
         for r, _ in lime_raw:
-            st.write(r)
+            st.write("•", r)
 
     with col2:
-        st.subheader("Anchor (Clean) + Smart LIME")
+        st.subheader("Anchor (Pseudo) + Smart LIME")
 
         st.write("### Union")
         for r in union_rules:
             st.success(r)
 
-        st.write("### Intersection")
+        st.write("### Intersection (Key Signal)")
         for r in intersection_rules:
             st.warning(r)
 
@@ -243,7 +242,7 @@ if file:
         st.info(exp)
 
     # =========================
-    # SURVEY
+    # SURVEY + SAVE
     # =========================
     with st.form("survey"):
 
@@ -252,7 +251,7 @@ if file:
         trust = st.slider("Trust", 1, 5)
         effort = st.slider("Effort", 1, 5)
 
-        preferred = st.radio("Preferred", ["LIME", "Anchor", "Both"])
+        preferred = st.radio("Preferred Explanation", ["LIME", "Anchor", "Both"])
         comments = st.text_area("Comments")
 
         if st.form_submit_button("Submit"):
@@ -275,4 +274,4 @@ if file:
                 sheet.append_row(row)
                 st.success("Saved to Google Sheets ✅")
             except Exception as e:
-                st.error(f"Error: {e}")
+                st.error(f"Error saving: {e}")
