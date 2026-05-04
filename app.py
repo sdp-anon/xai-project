@@ -10,7 +10,7 @@ from datetime import datetime
 import uuid
 from lime.lime_tabular import LimeTabularExplainer
 
-# ✅ NEW: Google Sheets
+# ✅ Google Sheets
 import gspread
 from google.oauth2.service_account import Credentials
 
@@ -34,22 +34,34 @@ st.caption(f"Participant ID: {st.session_state.user_id}")
 def connect_to_gsheet():
     creds = Credentials.from_service_account_info(
         st.secrets["gcp_service_account"],
-        scopes=["https://www.googleapis.com/auth/spreadsheets"]
+        scopes=[
+            "https://www.googleapis.com/auth/spreadsheets",
+            "https://www.googleapis.com/auth/drive"
+        ]
     )
     client = gspread.authorize(creds)
     return client
 
 def get_sheet():
     client = connect_to_gsheet()
-    sheet = client.open("XAI Survey Results").sheet1  # 🔥 change this
+    sheet = client.open("XAI Survey Results").sheet1
     return sheet
 
+def ensure_header(sheet):
+    header = [
+        "time","user","file","prob",
+        "clarity","usefulness","trust","effort",
+        "preferred","comments"
+    ]
+    
+    if sheet.row_count == 0 or sheet.row_values(1) != header:
+        sheet.insert_row(header, 1)
+
 # =========================
-# LOAD MODEL + DATA
+# LOAD MODEL
 # =========================
 @st.cache_resource
 def load_resources():
-
     zip_path = "nasa_model.zip"
     extract_path = "model_files"
 
@@ -65,7 +77,7 @@ def load_resources():
     train_path = f"{extract_path}/nasa_X_train.csv"
 
     if not os.path.exists(model_path):
-        st.error("❌ Model file not found after unzip!")
+        st.error("❌ Model file not found!")
         st.stop()
 
     model = joblib.load(model_path)
@@ -85,16 +97,7 @@ def load_resources():
 
     return model, feature_names, lime_explainer
 
-
 model, feature_names, lime_explainer = load_resources()
-
-# =========================
-# HEURISTICS
-# =========================
-HEURISTIC_THRESHOLDS = {
-    "wmc": 12, "rfc": 60, "cbo": 5, "loc": 100,
-    "npm": 10, "dit": 3, "noc": 2, "lcom": 10
-}
 
 # =========================
 # FUNCTIONS
@@ -116,34 +119,6 @@ def extract_metrics(code: str):
 def prepare_features(metrics):
     return np.array([[metrics.get(f, 0) for f in feature_names]])
 
-def extract_feature_name(rule_string):
-    match = re.search(r"(wmc|dit|noc|cbo|rfc|lcom|ca|ce|npm|loc)", rule_string)
-    return match.group(1) if match else None
-
-def smart_select_lime(lime_exp, metrics):
-    selected = []
-    for rule, weight in lime_exp:
-        if ("<" in rule and ">" in rule) or (rule.count('<') + rule.count('>') > 1):
-            continue
-
-        feature = extract_feature_name(rule)
-        if feature in HEURISTIC_THRESHOLDS:
-            if metrics.get(feature, 0) > HEURISTIC_THRESHOLDS[feature]:
-                selected.append(rule)
-    return selected
-
-def generate_human_explanation(smart_rules):
-    mapping = {
-        "loc": "High LOC → possible God Class.",
-        "wmc": "High WMC → too many complex methods.",
-        "rfc": "High RFC → too many method calls.",
-        "cbo": "High coupling → fragile class.",
-        "npm": "Too many public methods.",
-        "dit": "Deep inheritance → harder to understand.",
-        "lcom": "Low cohesion → poor design."
-    }
-    return list({mapping[extract_feature_name(r)] for r in smart_rules if extract_feature_name(r) in mapping})
-
 def predict_and_explain(code):
     metrics = extract_metrics(code)
     X = prepare_features(metrics)
@@ -154,16 +129,7 @@ def predict_and_explain(code):
         X[0], model.predict_proba, num_features=10
     ).as_list()
 
-    smart_lime = smart_select_lime(lime_raw, metrics)
-    human = generate_human_explanation(smart_lime)
-
-    return {
-        "prob": prob,
-        "severity": "High" if prob > 0.7 else "Medium" if prob > 0.3 else "Low",
-        "lime": lime_raw,
-        "combined": smart_lime,
-        "human": human
-    }
+    return prob, lime_raw
 
 # =========================
 # UI
@@ -172,25 +138,13 @@ file = st.file_uploader("Upload Java File", type=["java"])
 
 if file:
     code = file.read().decode("utf-8")
-    res = predict_and_explain(code)
+    prob, lime = predict_and_explain(code)
 
-    st.metric("Defect Probability", f"{res['prob']*100:.1f}%", delta=res["severity"])
+    st.metric("Defect Probability", f"{prob*100:.1f}%")
 
-    col1, col2 = st.columns(2)
-
-    with col1:
-        st.subheader("LIME")
-        for item in res["lime"]:
-            st.write(item)
-
-    with col2:
-        st.subheader("Rules")
-        for rule in res["combined"]:
-            st.success(rule)
-
-    st.subheader("Expert Explanation")
-    for exp in res["human"]:
-        st.info(exp)
+    st.subheader("LIME Explanation")
+    for item in lime:
+        st.write(item)
 
     # =========================
     # SURVEY
@@ -207,38 +161,26 @@ if file:
         comments = st.text_area("Comments")
 
         if st.form_submit_button("Submit"):
-            data = {
-                "time": datetime.now().isoformat(),
-                "user": st.session_state.user_id,
-                "file": file.name,
-                "prob": res["prob"],
-                "severity": res["severity"],
-                "clarity": clarity,
-                "usefulness": usefulness,
-                "trust": trust,
-                "effort": effort,
-                "preferred": preferred,
-                "comments": comments
-            }
+
+            data_row = [
+                datetime.now().isoformat(),
+                st.session_state.user_id,
+                file.name,
+                prob,
+                clarity,
+                usefulness,
+                trust,
+                effort,
+                preferred,
+                comments
+            ]
 
             try:
                 sheet = get_sheet()
+                ensure_header(sheet)
+                sheet.append_row(data_row)
 
-                sheet.append_row([
-                    data["time"],
-                    data["user"],
-                    data["file"],
-                    data["prob"],
-                    data["severity"],
-                    data["clarity"],
-                    data["usefulness"],
-                    data["trust"],
-                    data["effort"],
-                    data["preferred"],
-                    data["comments"]
-                ])
-
-                st.success("Saved to Google Sheets")
+                st.success("Saved to Google Sheets ✅")
 
             except Exception as e:
-                st.error(f"Error saving to Google Sheets: {e}")
+                st.error(f"Error: {e}")
