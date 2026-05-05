@@ -15,6 +15,9 @@ from lime.lime_tabular import LimeTabularExplainer
 # =========================
 st.set_page_config(page_title="XAI Study", layout="wide")
 
+# =========================
+# USER ID
+# =========================
 if "user_id" not in st.session_state:
     st.session_state.user_id = str(uuid.uuid4())[:8]
 
@@ -55,10 +58,17 @@ def load_resources():
 
 model, feature_names, lime_explainer = load_resources()
 
-VALID_FEATURES = {"wmc","rfc","cbo","loc","npm","dit","noc","lcom","ca","avg_cc"}
+# =========================
+# VALID FEATURES
+# =========================
+VALID_FEATURES = {
+    "wmc", "rfc", "cbo", "loc",
+    "npm", "dit", "noc", "lcom",
+    "ca", "avg_cc"
+}
 
 # =========================
-# METRICS
+# FEATURE EXTRACTION
 # =========================
 def extract_metrics(code):
     return {
@@ -80,116 +90,116 @@ def extract_feature(rule):
     return m.group(1) if m else None
 
 # =========================
-# LIME CLEAN
+# REMOVE RANGE RULES
+# =========================
+def is_simple_rule(rule):
+    if re.search(r"\d+(\.\d+)?\s*<\s*\w+\s*[≤<>=]\s*\d+", rule):
+        return False
+    return True
+
+# =========================
+# CLEAN LIME
 # =========================
 def clean_lime(lime_exp):
-    return [(r,w,extract_feature(r)) for r,w in lime_exp if extract_feature(r) in VALID_FEATURES]
+    cleaned = []
+    for rule, weight in lime_exp:
+        if not is_simple_rule(rule):
+            continue
+
+        feat = extract_feature(rule)
+        if feat in VALID_FEATURES:
+            cleaned.append((rule, feat))
+    return cleaned
 
 # =========================
-# RULE TYPE
+# DYNAMIC ANCHOR → RULES
 # =========================
-def rule_type(rule):
-    if "<" in rule and ">" in rule:
-        return "range"
-    if ">" in rule:
-        return "gt"
-    if "<" in rule:
-        return "lt"
-    return "other"
-
-# =========================
-# 🔥 DYNAMIC ANCHOR → RULES
-# =========================
-def dynamic_anchor_rules(X, metrics, model, feature_names, num_samples=200):
+def dynamic_anchor_rules(X, model, feature_names):
 
     base_pred = model.predict(X.reshape(1, -1))[0]
+
     importance = {f: 0.0 for f in feature_names}
 
-    for _ in range(num_samples):
+    for _ in range(200):
+        X_pert = X.copy()
         noise = np.random.normal(0, 0.1, size=X.shape)
-        X_pert = X + noise
+        X_pert = X_pert + noise
+
         pred = model.predict(X_pert.reshape(1, -1))[0]
 
         if pred == base_pred:
-            for i,f in enumerate(feature_names):
+            for i, f in enumerate(feature_names):
                 importance[f] += abs(noise[i])
 
+    # normalize
     for k in importance:
-        importance[k] /= num_samples
+        importance[k] /= 200
 
-    sorted_feats = sorted(importance.items(), key=lambda x: x[1], reverse=True)
+    values = np.array(list(importance.values()))
+    threshold = np.percentile(values, 60)
 
-    anchor = {}
-    coverage = 0
-    total = sum(v for _,v in sorted_feats)+1e-9
+    rules = {}
 
-    for f,score in sorted_feats:
-
+    for i, f in enumerate(feature_names):
         if f not in VALID_FEATURES:
             continue
 
-        coverage += score/total
+        score = importance[f]
 
-        val = metrics.get(f, 0)
-        anchor[f] = f"{f} > {val:.2f}"
+        if score >= threshold:
+            val = X[i]
 
-        if coverage > 0.7:
-            break
+            # ❌ REMOVE weak rules
+            if val <= 0:
+                continue
 
-    return anchor
+            rules[f] = f"{f} > {round(val,2)}"
 
-# =========================
-# 🔥 MERGE (YOUR LOGIC)
-# =========================
-def merge_rules(lime, anchor):
-
-    lime_map = {f:r for r,w,f in lime}
-    final = dict(anchor)
-
-    for f, lime_rule in lime_map.items():
-
-        if f in anchor:
-
-            t = rule_type(lime_rule)
-
-            if t in ["gt","range"]:
-                final[f] = lime_rule  # override with LIME
-
-    return final
+    return rules
 
 # =========================
-# INTERSECTION
+# MERGE (YOUR LOGIC)
 # =========================
-def build_intersection(lime, anchor):
-    lime_map = {f:r for r,w,f in lime}
-    inter = {}
+def merge_anchor_with_lime(anchor, lime):
 
-    for f in anchor:
-        if f in lime_map:
-            t = rule_type(lime_map[f])
-            if t in ["gt","range"]:
-                inter[f] = lime_map[f]
-            else:
-                inter[f] = anchor[f]
+    lime_dict = {f: r for r, f in lime}
 
-    return inter
+    final_anchor = {}
+    intersection = {}
+
+    for f, rule in anchor.items():
+
+        if f in lime_dict:
+
+            lime_rule = lime_dict[f]
+
+            # ✔ ONLY take LIME if it is ">"
+            if ">" in lime_rule and "<" not in lime_rule:
+                final_anchor[f] = lime_rule
+                intersection[f] = lime_rule
+
+        else:
+            final_anchor[f] = rule
+
+    return final_anchor, intersection
 
 # =========================
-# HUMAN
+# HUMAN EXPLANATION
 # =========================
-def humanize(inter):
+def humanize(intersection):
     mapping = {
-        "wmc":"High complexity in methods.",
-        "rfc":"Too many method calls.",
-        "cbo":"High coupling.",
-        "npm":"Too many public methods.",
-        "loc":"Large class size.",
-        "lcom":"Low cohesion.",
-        "dit":"Deep inheritance.",
-        "ca":"High dependency.",
-        "avg_cc":"Complex control flow."
+        "loc": "The class is large → hard to maintain.",
+        "wmc": "High complexity in methods.",
+        "rfc": "Too many method calls.",
+        "cbo": "High coupling between classes.",
+        "npm": "Too many public methods exposed.",
+        "dit": "Deep inheritance increases complexity.",
+        "lcom": "Low cohesion in the class.",
+        "ca": "High dependency on other classes.",
+        "avg_cc": "Complex control flow detected."
     }
-    return [mapping[f] for f in inter if f in mapping]
+
+    return [mapping[f] for f in intersection if f in mapping]
 
 # =========================
 # UI
@@ -204,39 +214,46 @@ if file:
 
     prob = float(model.predict_proba(X)[0][1])
 
+    # =========================
+    # LIME
+    # =========================
     lime_raw = lime_explainer.explain_instance(
         X[0], model.predict_proba, num_features=30
     ).as_list()
 
     lime_clean = clean_lime(lime_raw)
 
-    anchor = dynamic_anchor_rules(X[0], metrics, model, feature_names)
+    # =========================
+    # ANCHOR
+    # =========================
+    anchor_rules = dynamic_anchor_rules(X[0], model, feature_names)
 
-    merged = merge_rules(lime_clean, anchor)
-
-    intersection = build_intersection(lime_clean, anchor)
+    # =========================
+    # MERGE + INTERSECTION
+    # =========================
+    anchor_final, intersection = merge_anchor_with_lime(anchor_rules, lime_clean)
 
     # =========================
     # OUTPUT
     # =========================
     st.metric("Defect Probability", f"{prob*100:.1f}%")
 
-    col1,col2 = st.columns(2)
+    col1, col2 = st.columns(2)
 
     with col1:
         st.subheader("LIME")
-        for r,_,_ in lime_clean:
+        for r, _ in lime_clean:
             st.write("•", r)
 
     with col2:
-        st.subheader("Anchor (Dynamic Rules)")
-        for r in merged.values():
+        st.subheader("Anchor (Final)")
+        for r in anchor_final.values():
             st.success(r)
 
-    st.subheader("Intersection (Final Signal)")
+    st.subheader("Intersection (Strict Agreement)")
     for r in intersection.values():
         st.warning(r)
 
-    st.subheader("Human Explanation")
+    st.subheader("Explanation")
     for exp in humanize(intersection):
         st.info(exp)
