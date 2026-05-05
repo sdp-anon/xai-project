@@ -1,8 +1,8 @@
-streamlit
-joblib
+fastapi
+uvicorn
 numpy
 pandas
 scikit-learn
-lime
-gspread
-google-auth
+joblib
+alibi
+tensorflow
